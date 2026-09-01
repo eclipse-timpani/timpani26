@@ -30,15 +30,30 @@ descriptions into this file. Use the document that owns the information.
 - Use `README.md` and the relevant component README for project scope, setup,
   and usage.
 - Read the relevant document in `doc/architecture/` for architecture changes.
-- Read the relevant DDR in `doc/design/` before changing scheduling behavior,
-  workload semantics, resource allocation, protocols, BPF behavior, runtime
-  updates, or fault handling.
+- Before changing a topic, read the associated design documents in `doc/design/`:
+
+  | Topic | Documents |
+  |:--|:--|
+  | Workload semantics and L1-L4 classification | `DDR-001` |
+  | Scheduling architecture and HSF | `DDR-002` |
+  | Interfaces and protocols | `DDR-003` |
+  | Resource allocation and CPU assignment | `DDR-004` |
+  | eBPF scheduling behavior | `DDR-005` |
+  | Communication and runtime updates | `DDR-006`, `DDR-011` |
+  | TT/CBS integration and hyperperiods | `DDR-007` |
+  | Fault handling and recovery | `DDR-012` |
+
+  When a change spans multiple topics, read all relevant documents.
 - Use `doc/contribution/` for coding, testing, commit, and pull request rules.
 - Read documentation on demand. If two documents conflict, identify the
   conflict and ask for clarification before making a policy-sensitive change.
 - Treat the current checkout and the current GitHub repository state as the
   working baseline. Do not assume that a historical or unadvertised branch
   exists.
+- Before introducing a new component, service, communication path, scheduling
+  decision, or public API, verify that it is consistent with `doc/architecture/`
+  and the relevant DDRs. If the design is unclear or conflicts with existing
+  documents, ask the Project Leader before implementation.
 
 ## Engineering constraints
 
@@ -66,6 +81,9 @@ descriptions into this file. Use the document that owns the information.
   and tests.
 - Run the narrowest relevant build, test, lint, or static-analysis command
   after making a change.
+- Avoid full-repository builds when a component-local validation is sufficient.
+- Use broader validation for cross-component, shared-interface, workflow, or
+  release-related changes.
 - Use the component README and repository scripts for exact build commands.
 - C, C++, BPF, and target-hardware validation may require Linux, WSL, a
   container, or the target device. Do not claim that a check passed when it
