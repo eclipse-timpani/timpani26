@@ -92,15 +92,22 @@ descriptions into this file. Use the document that owns the information.
 
 ## GitHub workflow
 
-- The current default branch is `main`. Verify the current remote state before
-  creating a branch.
+- `develop_1.0` is the default branch for ongoing development and integration.
+  Verify the current remote state before creating a branch or pull request.
+- `main` is reserved for release-qualified delivery.
 - For non-trivial work, create or update a GitHub Issue and link the change to
   it. Follow the existing issue titles `[FEATURE]`, `[TASK]`, and `[BUG]`.
+- Create one short-lived topic branch for each independent non-trivial change.
+  These branches isolate Issue work and provide focused review and CI; delete
+  them after merging.
 - Use a branch name in the form `<type>/<issue-number>-<short-description>`.
   Common types are `feat`, `fix`, `refactor`, `docs`, `test`, and `chore`.
 - Use the repository's conventional commit format and include the Issue
-  number, for example `docs(workflow): update Copilot guidance [#36]`.
-- Open a Pull Request targeting `main`, include `Closes #<issue-number>` when
-  the PR completes the Issue, and describe the validation performed.
-- Do not push directly to `main`, force-push, or merge a Pull Request without
-  the user's explicit request and the required project review.
+  number, for example `docs(copilot): align workflow with develop_1.0 [#38]`.
+- Open implementation pull requests from the topic branch to `develop_1.0`.
+  Include `Closes #<issue-number>` when the implementation PR completes the
+  Issue, and describe the validation performed.
+- Promote selected release-qualified changes from `develop_1.0` to `main`
+  through a reviewed release pull request.
+- Do not push directly to `develop_1.0` or `main`, force-push, or merge a pull
+  request without the user's explicit request and the required project review.
