@@ -18,6 +18,7 @@
 #include "fault_client.h"
 #include "node_config.h"
 #include "orchestrator_service.h"
+#include "publication_coordinator.h"
 #include "schedinfo_service.h"
 #include "recovery_service.h"
 #include "tlog.h"
@@ -187,6 +188,7 @@ int main(int argc, char** argv)
     const auto kRetryBaseDelay = std::chrono::milliseconds(500);
     const auto kRetryMaxDelay = std::chrono::seconds(8);
     constexpr int kRetryBackoffMaxShift = 4;
+    PublicationCoordinator publication;
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -226,6 +228,7 @@ int main(int argc, char** argv)
         if (changed) {
             if (sched_tables.empty()) {
                 TLOG_WARN("SchedInfo marked changed but map is empty");
+                publication.BeginGeneration();
                 replay_pending = true;
                 synced_nodes.clear();
                 replay_failures.clear();
@@ -235,14 +238,10 @@ int main(int argc, char** argv)
                 int changed_count = 0;
                 for (const auto& node_id : connected_nodes) {
                     auto it = sched_tables.find(node_id);
-                    timpani::node::v1::HierarchicalScheduleTable new_table;
-                    if (it != sched_tables.end()) {
-                        new_table = it->second;
-                    } else {
-                        new_table.set_table_id("table_v1");
-                        new_table.set_node_id(node_id);
-                        new_table.set_hyperperiod_us(10000);
-                    }
+                    timpani::node::v1::HierarchicalScheduleTable new_table =
+                        (it != sched_tables.end())
+                            ? it->second
+                            : PublicationCoordinator::MakeEmptyTable(node_id);
 
                     auto last_it = last_pushed_tables.find(node_id);
                     bool node_table_changed = true;
@@ -265,6 +264,8 @@ int main(int argc, char** argv)
                     }
                 }
                 if (changed_count > 0) {
+                    // New schedule generation: its batch gets a fresh epoch.
+                    publication.BeginGeneration();
                     replay_pending = true;
                     TLOG_INFO("SchedInfo changed - replay queued for ", changed_count,
                               " / ", connected_nodes.size(), " connected node(s)");
@@ -286,32 +287,48 @@ int main(int argc, char** argv)
 
                 bool all_push_ok = true;
                 auto now = std::chrono::steady_clock::now();
+                auto is_due = [&](const std::string& node_id) {
+                    auto retry_it = next_retry_time.find(node_id);
+                    return retry_it == next_retry_time.end() ||
+                           now >= retry_it->second;
+                };
+
+                bool any_due = false;
+                for (const auto& node_id : connected_nodes) {
+                    if (synced_nodes.find(node_id) == synced_nodes.end() &&
+                        is_due(node_id)) {
+                        any_due = true;
+                        break;
+                    }
+                }
+
+                // Prepare the whole batch (including empty tables) and stamp
+                // one common epoch only when something is actually published.
+                PublicationCoordinator::PreparedBatch batch;
+                if (any_due) {
+                    batch = publication.PrepareBatch(connected_nodes, sched_tables);
+                    if (batch.epoch_renewed && !synced_nodes.empty()) {
+                        TLOG_INFO("Common epoch renewed to ", batch.epoch_ns,
+                                  " ns - resending all connected nodes");
+                        synced_nodes.clear();
+                    }
+                }
+
                 for (const auto& node_id : connected_nodes) {
                     if (synced_nodes.find(node_id) != synced_nodes.end()) {
                         continue;
                     }
-
-                    auto retry_it = next_retry_time.find(node_id);
-                    if (retry_it != next_retry_time.end() && now < retry_it->second) {
+                    if (!is_due(node_id)) {
                         continue;
                     }
 
-                    // Look up the combined table for this node
-                    auto it = sched_tables.find(node_id);
-                    timpani::node::v1::HierarchicalScheduleTable table_to_push;
-                    if (it != sched_tables.end()) {
-                        table_to_push = it->second;
-                    } else {
-                        TLOG_INFO("No schedule table for node '", node_id, "' — generating empty table for cleanup/sync");
-                        table_to_push.set_table_id("table_v1");
-                        table_to_push.set_node_id(node_id);
-                        table_to_push.set_hyperperiod_us(10000);
-                        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        table_to_push.set_epoch_ns(static_cast<uint64_t>(now_ns));
+                    if (sched_tables.find(node_id) == sched_tables.end()) {
+                        TLOG_INFO("No schedule table for node '", node_id, "' — sending empty table for cleanup/sync");
                     }
+                    const auto& table_to_push = batch.tables.at(node_id);
 
-                    TLOG_INFO("Replaying schedule table for node '", node_id, "'");
+                    TLOG_INFO("Replaying schedule table for node '", node_id,
+                              "' (epoch_ns=", table_to_push.epoch_ns(), ")");
                     bool ok = g_orchestrator_service->push_full_table(node_id, table_to_push);
                     TLOG_INFO("push_full_table(\"", node_id, "\") => ",
                               ok ? "OK" : "FAILED");

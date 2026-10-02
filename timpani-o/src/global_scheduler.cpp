@@ -492,10 +492,8 @@ timpani::node::v1::HierarchicalScheduleTable GlobalScheduler::build_table(
     table.set_node_id(node_id);
     table.set_hyperperiod_us(static_cast<uint32_t>(hyperperiod_us));
 
-    // epoch_ns = current wall-clock time (CLOCK_REALTIME)
-    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    table.set_epoch_ns(static_cast<uint64_t>(now_ns));
+    // epoch_ns is left unset here: one common epoch is applied to every
+    // table of a publication batch by PublicationCoordinator (DDR-004 §9).
 
     int total_tt = 0;
     int total_cbs = 0;

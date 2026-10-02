@@ -96,6 +96,34 @@ set_tests_properties(GlobalSchedulerTest PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+# Create PublicationCoordinator test executable
+add_executable(test_publication_coordinator
+    test_publication_coordinator.cpp
+    ../src/publication_coordinator.cpp
+    ../src/global_scheduler.cpp
+    ../src/node_config.cpp
+)
+
+# Link libraries for PublicationCoordinator test
+target_link_libraries(test_publication_coordinator
+    GTest::gtest
+    GTest::gtest_main
+    gRPC::grpc++
+    protobuf::libprotobuf
+    schedinfo_proto
+    node_control_proto
+    pthread
+)
+
+# Add PublicationCoordinator test
+add_test(NAME PublicationCoordinatorTest COMMAND test_publication_coordinator)
+
+# Set test properties for PublicationCoordinator test
+set_tests_properties(PublicationCoordinatorTest PROPERTIES
+    TIMEOUT 30
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
 # Create NodeConfig test executable
 add_executable(test_node_config
     test_node_config.cpp

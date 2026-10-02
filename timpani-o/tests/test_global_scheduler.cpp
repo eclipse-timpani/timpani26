@@ -301,7 +301,8 @@ TEST_F(GlobalSchedulerTest, TableHasRequiredFields) {
     EXPECT_FALSE(table.table_id().empty());
     EXPECT_EQ(table.node_id(), "node1");
     EXPECT_GT(table.hyperperiod_us(), 0u);
-    EXPECT_GT(table.epoch_ns(), 0u);
+    // epoch_ns is assigned per publication batch, not per node table.
+    EXPECT_EQ(table.epoch_ns(), 0u);
 
     // Check TT slot hashes are non-zero
     for (int p = 0; p < table.partitions_size(); ++p) {
