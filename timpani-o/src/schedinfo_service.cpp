@@ -86,16 +86,32 @@ Status SchedInfoServiceImpl::AddSchedInfo(ServerContext* context,
         return Status::OK;
     }
 
-    // Determine target nodes from tasks
-    std::set<std::string> target_nodes;
+    // Assign tasks to nodes by their own node_id. A workload must either set
+    // node_id on every task or on none (placement would be ambiguous).
+    int tasks_with_node = 0;
     for (const auto& task : request->tasks()) {
         if (!task.node_id().empty()) {
-            target_nodes.insert(task.node_id());
+            tasks_with_node++;
         }
     }
 
-    if (target_nodes.empty()) {
+    if (tasks_with_node != 0 && tasks_with_node != request->tasks_size()) {
+        TLOG_ERROR("Workload '", request->workload_id(), "' has ",
+                   request->tasks_size() - tasks_with_node, " of ",
+                   request->tasks_size(),
+                   " task(s) without node_id - rejected");
+        reply->set_status(-1);
+        return Status::OK;
+    }
+
+    std::map<std::string, std::vector<ClassifiedTask>> node_tasks;
+    if (tasks_with_node > 0) {
+        for (int i = 0; i < request->tasks_size(); i++) {
+            node_tasks[request->tasks(i).node_id()].push_back(classified[i]);
+        }
+    } else {
         // If no node specified, use all configured nodes
+        std::set<std::string> target_nodes;
         if (node_config_manager_ && node_config_manager_->IsLoaded()) {
             for (const auto& [nid, _] : node_config_manager_->GetAllNodes()) {
                 target_nodes.insert(nid);
@@ -104,14 +120,16 @@ Status SchedInfoServiceImpl::AddSchedInfo(ServerContext* context,
         if (target_nodes.empty()) {
             target_nodes.insert("default");
         }
+        for (const auto& nid : target_nodes) {
+            node_tasks[nid] = classified;
+        }
     }
 
     std::unique_lock<std::shared_mutex> lock(schedule_mutex_);
 
     // Store/replace classified tasks for this workload
     WorkloadEntry entry;
-    entry.target_nodes = target_nodes;
-    entry.tasks = std::move(classified);
+    entry.node_tasks = std::move(node_tasks);
     workload_tasks_[request->workload_id()] = std::move(entry);
 
     // Regenerate schedule tables for ALL workloads combined per node
@@ -144,7 +162,9 @@ bool SchedInfoServiceImpl::RegenerateAllSchedules(std::string& error_detail)
     // so nodes with 0 remaining tasks receive an empty table.
     std::set<std::string> all_nodes;
     for (const auto& [wl_id, entry] : workload_tasks_) {
-        all_nodes.insert(entry.target_nodes.begin(), entry.target_nodes.end());
+        for (const auto& [node_id, tasks] : entry.node_tasks) {
+            all_nodes.insert(node_id);
+        }
     }
     for (const auto& [node_id, table] : schedule_tables_) {
         all_nodes.insert(node_id);
@@ -153,12 +173,13 @@ bool SchedInfoServiceImpl::RegenerateAllSchedules(std::string& error_detail)
     ScheduleTableMap new_tables;
 
     for (const auto& node_id : all_nodes) {
-        // Gather ALL classified tasks destined for this node
+        // Gather the classified tasks assigned to this node by every workload
         std::vector<ClassifiedTask> all_tasks;
         for (const auto& [wl_id, entry] : workload_tasks_) {
-            if (entry.target_nodes.count(node_id)) {
+            auto it = entry.node_tasks.find(node_id);
+            if (it != entry.node_tasks.end()) {
                 all_tasks.insert(all_tasks.end(),
-                                 entry.tasks.begin(), entry.tasks.end());
+                                 it->second.begin(), it->second.end());
             }
         }
 
