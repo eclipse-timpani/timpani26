@@ -308,7 +308,7 @@ int main(int argc, char** argv)
                 if (any_due) {
                     batch = publication.PrepareBatch(connected_nodes, sched_tables);
                     if (batch.epoch_renewed && !synced_nodes.empty()) {
-                        TLOG_INFO("Common epoch renewed to ", batch.epoch_ns,
+                        TLOG_INFO("New generation epoch ", batch.epoch_ns,
                                   " ns - resending all connected nodes");
                         synced_nodes.clear();
                     }

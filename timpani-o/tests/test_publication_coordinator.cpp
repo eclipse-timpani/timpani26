@@ -120,49 +120,41 @@ TEST_F(PublicationCoordinatorTest, EmptyTablesUseCommonEpoch) {
     ExpectCommonEpoch(batch);
 }
 
-TEST_F(PublicationCoordinatorTest, RetryReusesEpochWhileMarginRemains) {
+TEST_F(PublicationCoordinatorTest, RetryReusesEpochWithoutClockRead) {
     ScheduleTableMap tables = {{"node1", Generate("node1", 10000)},
                                {"node2", Generate("node2", 10000)}};
-    // Retry at the same instant: exactly the full margin still remains.
     auto first = coordinator_->PrepareBatch({"node1", "node2"}, tables);
 
+    now_ns_ += margin_ / 2;
     auto retry = coordinator_->PrepareBatch({"node2"}, tables);
     EXPECT_FALSE(retry.epoch_renewed);
     EXPECT_EQ(retry.epoch_ns, first.epoch_ns);
     EXPECT_EQ(retry.tables.at("node2").epoch_ns(), first.epoch_ns);
+    EXPECT_EQ(clock_calls_, 1);  // only the first batch of the generation
 }
 
-TEST_F(PublicationCoordinatorTest, InsufficientMarginRenewsWholeBatch) {
+TEST_F(PublicationCoordinatorTest, ExpiredEpochReusedWithinGeneration) {
     ScheduleTableMap tables = {{"node1", Generate("node1", 10000)},
                                {"node2", Generate("node2", 10000)}};
     auto first = coordinator_->PrepareBatch({"node1", "node2"}, tables);
 
-    now_ns_ += 1;  // remaining time is now just below the margin
+    // Epoch has passed: the same grid is kept so running nodes keep their
+    // phase; TIMPANI-N catches up to the next hyperperiod boundary.
+    now_ns_ += 10 * margin_;
     auto retry = coordinator_->PrepareBatch({"node1", "node2"}, tables);
 
-    EXPECT_TRUE(retry.epoch_renewed);
-    EXPECT_EQ(retry.epoch_ns, now_ns_ + margin_);
-    EXPECT_NE(retry.epoch_ns, first.epoch_ns);
+    EXPECT_FALSE(retry.epoch_renewed);
+    EXPECT_EQ(retry.epoch_ns, first.epoch_ns);
     ExpectCommonEpoch(retry);
+    EXPECT_EQ(clock_calls_, 1);
 }
 
-TEST_F(PublicationCoordinatorTest, ExpiredEpochRenews) {
-    ScheduleTableMap tables = {{"node1", Generate("node1", 10000)}};
-    coordinator_->PrepareBatch({"node1"}, tables);
-
-    now_ns_ += 2 * margin_;  // epoch already in the past
-    auto retry = coordinator_->PrepareBatch({"node1"}, tables);
-
-    EXPECT_TRUE(retry.epoch_renewed);
-    EXPECT_EQ(retry.epoch_ns, now_ns_ + margin_);
-}
-
-TEST_F(PublicationCoordinatorTest, ReconnectReusesValidEpoch) {
+TEST_F(PublicationCoordinatorTest, ReconnectReusesGenerationEpoch) {
     ScheduleTableMap tables = {{"node1", Generate("node1", 10000)},
                                {"node2", Generate("node2", 10000)}};
     auto first = coordinator_->PrepareBatch({"node1"}, tables);
 
-    now_ns_ -= margin_;  // plenty of time left before the cached epoch
+    now_ns_ += 300ULL * 1000 * 1000 * 1000;  // node2 joins much later
     auto reconnect = coordinator_->PrepareBatch({"node1", "node2"}, tables);
 
     EXPECT_FALSE(reconnect.epoch_renewed);
@@ -184,13 +176,16 @@ TEST_F(PublicationCoordinatorTest, NewGenerationGetsNewEpoch) {
     EXPECT_EQ(clock_calls_, 2);
 }
 
-TEST_F(PublicationCoordinatorTest, EpochNotEarlierThanNowPlusMargin) {
+TEST_F(PublicationCoordinatorTest, NewEpochNotEarlierThanNowPlusMargin) {
     ScheduleTableMap tables = {{"node1", Generate("node1", 10000)}};
     for (int i = 0; i < 5; ++i) {
+        coordinator_->BeginGeneration();
         auto batch = coordinator_->PrepareBatch({"node1"}, tables);
+        EXPECT_TRUE(batch.epoch_renewed);
         EXPECT_GE(batch.epoch_ns, now_ns_ + margin_);
         now_ns_ += margin_ / 3;
     }
+    EXPECT_EQ(clock_calls_, 5);
 }
 
 TEST_F(PublicationCoordinatorTest, DefaultClockProducesFutureEpoch) {

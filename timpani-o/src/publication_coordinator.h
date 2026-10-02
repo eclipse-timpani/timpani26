@@ -27,9 +27,11 @@
  * is applied to every table in the batch.
  *
  * The epoch is cached per schedule generation. Retries and reconnecting
- * nodes of the same generation reuse it while at least
- * propagation_margin_ns remains; otherwise a new epoch is calculated and
- * the whole batch must be resent (PreparedBatch::epoch_renewed).
+ * nodes of the same generation reuse it, even after it has passed, so
+ * nodes that are already running keep their phase; TIMPANI-N aligns a
+ * late table to the next epoch + k * hyperperiod boundary. A new epoch is
+ * calculated only for the first batch of a new generation, and the whole
+ * batch must then be resent (PreparedBatch::epoch_renewed).
  */
 class PublicationCoordinator {
 public:
@@ -39,7 +41,7 @@ public:
     struct PreparedBatch {
         ScheduleTableMap tables;   // node_id → table stamped with epoch_ns
         uint64_t epoch_ns = 0;
-        bool epoch_renewed = false; // true → resend every node in the batch
+        bool epoch_renewed = false; // new generation epoch → resend all nodes
     };
 
     PublicationCoordinator();

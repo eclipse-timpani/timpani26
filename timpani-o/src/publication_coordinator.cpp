@@ -42,12 +42,13 @@ PublicationCoordinator::PreparedBatch PublicationCoordinator::PrepareBatch(
         }
     }
 
-    // 2. Sample CLOCK_REALTIME once, immediately before publication, and
-    //    reuse the cached epoch only while the full margin remains.
-    uint64_t now_ns = clock_();
-    if (!has_epoch_ || epoch_ns_ < now_ns ||
-        epoch_ns_ - now_ns < kPropagationMarginNs) {
-        epoch_ns_ = now_ns + kPropagationMarginNs;
+    // 2. First batch of a generation: sample CLOCK_REALTIME once,
+    //    immediately before publication. Later batches (retry, reconnect)
+    //    reuse the cached epoch even if it has passed: TimerMaster catches
+    //    up on the same epoch + k * hyperperiod grid, so running nodes keep
+    //    their phase and late nodes join it.
+    if (!has_epoch_) {
+        epoch_ns_ = clock_() + kPropagationMarginNs;
         has_epoch_ = true;
         batch.epoch_renewed = true;
     }
