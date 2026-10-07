@@ -54,6 +54,90 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # BPF build option
 option(CONFIG_TRACE_BPF "Enable eBPF sched_ext scheduler" ON)
 option(CONFIG_TRACE_BPF_EVENT "Enable eBPF schedstat tracing for gpdata output" OFF)
+set(TIMPANI_KERNEL_BTF_FILE "/sys/kernel/btf/vmlinux" CACHE FILEPATH
+    "BTF ELF file for the kernel targeted by the sched_ext BPF build")
+set(TIMPANI_SCX_API "AUTO" CACHE STRING
+    "sched_ext API family: AUTO, LEGACY, or DSQ")
+set_property(CACHE TIMPANI_SCX_API PROPERTY STRINGS AUTO LEGACY DSQ)
+
+if(CONFIG_TRACE_BPF)
+    find_program(BPFTOOL_EXECUTABLE bpftool)
+    if(NOT BPFTOOL_EXECUTABLE)
+        message(FATAL_ERROR "bpftool is required when CONFIG_TRACE_BPF=ON")
+    endif()
+    if(NOT EXISTS "${TIMPANI_KERNEL_BTF_FILE}")
+        message(FATAL_ERROR
+            "Kernel BTF not found: ${TIMPANI_KERNEL_BTF_FILE}. Set TIMPANI_KERNEL_BTF_FILE to the target kernel's BTF ELF.")
+    endif()
+    # Re-run API detection when the target BTF changes (e.g. kernel upgrade)
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${TIMPANI_KERNEL_BTF_FILE}")
+
+    execute_process(
+        COMMAND "${BPFTOOL_EXECUTABLE}" btf dump file "${TIMPANI_KERNEL_BTF_FILE}" format raw
+        RESULT_VARIABLE TIMPANI_BTF_RESULT
+        OUTPUT_VARIABLE TIMPANI_KERNEL_BTF
+        ERROR_VARIABLE TIMPANI_BTF_ERROR
+    )
+    if(NOT "${TIMPANI_BTF_RESULT}" STREQUAL "0")
+        message(FATAL_ERROR
+            "Could not read kernel BTF ${TIMPANI_KERNEL_BTF_FILE}: ${TIMPANI_BTF_ERROR}")
+    endif()
+
+    string(TOUPPER "${TIMPANI_SCX_API}" TIMPANI_SCX_API_SELECTED)
+    if(TIMPANI_SCX_API_SELECTED STREQUAL "AUTO")
+        set(TIMPANI_HAS_NEW_DSQ_API TRUE)
+        foreach(symbol scx_bpf_dsq_insert scx_bpf_dsq_move scx_bpf_dsq_move_to_local)
+            string(FIND "${TIMPANI_KERNEL_BTF}" "FUNC '${symbol}'" symbol_position)
+            if(symbol_position EQUAL -1)
+                set(TIMPANI_HAS_NEW_DSQ_API FALSE)
+            endif()
+        endforeach()
+
+        set(TIMPANI_HAS_LEGACY_DSQ_API TRUE)
+        foreach(symbol scx_bpf_dispatch scx_bpf_dispatch_from_dsq scx_bpf_consume)
+            string(FIND "${TIMPANI_KERNEL_BTF}" "FUNC '${symbol}'" symbol_position)
+            if(symbol_position EQUAL -1)
+                set(TIMPANI_HAS_LEGACY_DSQ_API FALSE)
+            endif()
+        endforeach()
+
+        if(TIMPANI_HAS_NEW_DSQ_API)
+            set(TIMPANI_SCX_API_SELECTED "DSQ")
+        elseif(TIMPANI_HAS_LEGACY_DSQ_API)
+            set(TIMPANI_SCX_API_SELECTED "LEGACY")
+        else()
+            message(FATAL_ERROR
+                "Target kernel BTF exposes neither the complete legacy nor DSQ sched_ext API")
+        endif()
+    elseif(NOT TIMPANI_SCX_API_SELECTED STREQUAL "LEGACY" AND
+           NOT TIMPANI_SCX_API_SELECTED STREQUAL "DSQ")
+        message(FATAL_ERROR
+            "TIMPANI_SCX_API must be AUTO, LEGACY, or DSQ (got '${TIMPANI_SCX_API}')")
+    endif()
+
+    if(TIMPANI_SCX_API_SELECTED STREQUAL "DSQ")
+        set(TIMPANI_SCX_USE_NEW_DSQ_API 1)
+        set(TIMPANI_REQUIRED_DSQ_KFUNCS
+            scx_bpf_dsq_insert scx_bpf_dsq_move scx_bpf_dsq_move_to_local)
+    else()
+        set(TIMPANI_SCX_USE_NEW_DSQ_API 0)
+        set(TIMPANI_REQUIRED_DSQ_KFUNCS
+            scx_bpf_dispatch scx_bpf_dispatch_from_dsq scx_bpf_consume)
+    endif()
+    list(APPEND TIMPANI_REQUIRED_DSQ_KFUNCS
+        scx_bpf_create_dsq scx_bpf_kick_cpu
+        bpf_iter_scx_dsq_new bpf_iter_scx_dsq_next bpf_iter_scx_dsq_destroy)
+    foreach(symbol ${TIMPANI_REQUIRED_DSQ_KFUNCS})
+        string(FIND "${TIMPANI_KERNEL_BTF}" "FUNC '${symbol}'" symbol_position)
+        if(symbol_position EQUAL -1)
+            message(FATAL_ERROR
+                "Target kernel BTF is missing required sched_ext kfunc '${symbol}'")
+        endif()
+    endforeach()
+    message(STATUS
+        "Using sched_ext ${TIMPANI_SCX_API_SELECTED} API from ${TIMPANI_KERNEL_BTF_FILE}")
+endif()
 
 set(TIMPANI_ENABLE_GPDATA OFF)
 if(CONFIG_TRACE_BPF_EVENT AND NOT CONFIG_TRACE_BPF)
@@ -118,8 +202,10 @@ if(CONFIG_TRACE_BPF)
     # Load bpf.cmake
     include(bpf)
 
-    # BPF include path for clang
-    set(BPF_EXTRA_CFLAGS "-I${SHARED_LIBBPF_PATH}/src")
+    # BPF include path and selected sched_ext API for clang
+    set(BPF_EXTRA_CFLAGS
+        "-I${SHARED_LIBBPF_PATH}/src"
+        "-DTIMPANI_SCX_USE_NEW_DSQ_API=${TIMPANI_SCX_USE_NEW_DSQ_API}")
 
     add_compile_definitions(CONFIG_TRACE_BPF=1)
 

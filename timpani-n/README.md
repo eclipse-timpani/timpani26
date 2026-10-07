@@ -142,6 +142,15 @@ cmake -DGIT_COMMIT_HASH=$GIT_HASH .. && make
 | `CONFIG_TRACE_BPF` | ON | Enable eBPF sched_ext scheduler |
 | `CONFIG_TRACE_EVENT` | ON | Enable ftrace for sched/timer events |
 | `CONFIG_TRACE_BPF_EVENT` | OFF | Track sched_switch/waking events |
+| `TIMPANI_KERNEL_BTF_FILE` | `/sys/kernel/btf/vmlinux` | Target kernel BTF ELF used for API detection and `vmlinux.h` generation |
+| `TIMPANI_SCX_API` | `AUTO` | Select `AUTO`, `LEGACY`, or `DSQ` sched_ext kfunc family |
+
+With `TIMPANI_SCX_API=AUTO`, CMake detects the helper set from the target BTF.
+Mainline Linux 6.12 uses the legacy API; the DSQ API is available from 6.13.
+The BTF-based selection also handles kernels that backport either helper set.
+For cross-builds, point `TIMPANI_KERNEL_BTF_FILE` at the target kernel's BTF ELF.
+Set `TIMPANI_SCX_API` explicitly only when the target BTF exposes both complete
+helper sets and the build should prefer one of them.
 
 ```bash
 # Disable BPF (fallback to timer-only mode)

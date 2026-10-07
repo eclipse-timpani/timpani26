@@ -90,12 +90,27 @@ struct {
 // SCX helpers (kfuncs) usually predefined if correctly linked, or we can
 // declare them as extern
 extern s32 scx_bpf_create_dsq(__u64 dsq_id, __s32 node) __ksym;
+#ifndef TIMPANI_SCX_USE_NEW_DSQ_API
+#error "TIMPANI_SCX_USE_NEW_DSQ_API must be selected by CMake"
+#endif
+#if TIMPANI_SCX_USE_NEW_DSQ_API
+extern void scx_bpf_dsq_insert(struct task_struct* p, __u64 dsq_id, u64 slice,
+                               u64 enq_flags) __ksym;
+extern bool scx_bpf_dsq_move(struct bpf_iter_scx_dsq* it,
+                             struct task_struct* p, __u64 dsq_id,
+                             __u64 enq_flags) __ksym;
+extern bool scx_bpf_dsq_move_to_local(__u64 dsq_id) __ksym;
+#define scx_bpf_dispatch scx_bpf_dsq_insert
+#define scx_bpf_dispatch_from_dsq scx_bpf_dsq_move
+#define scx_bpf_consume scx_bpf_dsq_move_to_local
+#else
 extern void scx_bpf_dispatch(struct task_struct* p, __u64 dsq_id, u64 slice,
                              u64 enq_flags) __ksym;
 extern bool scx_bpf_dispatch_from_dsq(struct bpf_iter_scx_dsq* it,
                                       struct task_struct* p, __u64 dsq_id,
                                       __u64 enq_flags) __ksym;
 extern bool scx_bpf_consume(__u64 dsq_id) __ksym;
+#endif
 extern void scx_bpf_kick_cpu(__s32 cpu, u64 flags) __ksym;
 extern int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq* it, __u64 dsq_id,
                                 __u64 flags) __ksym;
