@@ -155,7 +155,7 @@ TEST_F(SchedInfoServiceTest, AddSchedInfoWithDifferentPolicies) {
     task2->set_period(2000000);
     task2->set_runtime(200000);
     task2->set_deadline(1800000);
-    task2->set_node_id("node2");
+    task2->set_node_id("node1");
 
     TaskInfo* task3 = sched_info.add_tasks();
     task3->set_name("rr_task");
@@ -252,69 +252,36 @@ static void AddTtTask(SchedInfo& info, const std::string& name,
     task->set_node_id(node_id);
 }
 
-TEST_F(SchedInfoServiceTest, TasksArePlacedOnlyOnTheirOwnNode) {
-    SchedInfo info;
-    info.set_workload_id("split");
-    AddTtTask(info, "a_task", "nodeA", 100000);
-    AddTtTask(info, "b_task", "nodeB", 50000);
+TEST_F(SchedInfoServiceTest, WorkloadsOnSameNodeAreMerged) {
+    SchedInfo wl1;
+    wl1.set_workload_id("wl1");
+    AddTtTask(wl1, "wl1_t0", "nodeA", 100000);
+    AddTtTask(wl1, "wl1_t1", "nodeA", 50000);
 
-    Response reply;
-    grpc::ServerContext context;
-    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &info, &reply).ok());
-    ASSERT_EQ(reply.status(), 0);
+    SchedInfo wl2;
+    wl2.set_workload_id("wl2");
+    AddTtTask(wl2, "wl2_t0", "nodeA", 100000);
+
+    SchedInfo wl3;
+    wl3.set_workload_id("wl3");
+    AddTtTask(wl3, "wl3_t0", "nodeB", 100000);
+
+    for (SchedInfo* info : {&wl1, &wl2, &wl3}) {
+        Response reply;
+        grpc::ServerContext context;
+        ASSERT_TRUE(service_impl_->AddSchedInfo(&context, info, &reply).ok());
+        ASSERT_EQ(reply.status(), 0) << info->workload_id();
+    }
 
     auto tables = service_impl_->GetScheduleTables();
     ASSERT_EQ(tables.size(), 2u);
     EXPECT_EQ(TableTaskIds(tables.at("nodeA")),
-              std::set<std::string>({"a_task"}));
+              std::set<std::string>({"wl1_t0", "wl1_t1", "wl2_t0"}));
     EXPECT_EQ(TableTaskIds(tables.at("nodeB")),
-              std::set<std::string>({"b_task"}));
-    EXPECT_EQ(tables.at("nodeA").hyperperiod_us(), 100000u);
-    EXPECT_EQ(tables.at("nodeB").hyperperiod_us(), 50000u);
+              std::set<std::string>({"wl3_t0"}));
 }
 
-TEST_F(SchedInfoServiceTest, WorkloadsSharingANodeAreMergedPerNode) {
-    SchedInfo first;
-    first.set_workload_id("wl1");
-    AddTtTask(first, "wl1_a", "nodeA", 100000);
-    AddTtTask(first, "wl1_b", "nodeB", 100000);
-
-    SchedInfo second;
-    second.set_workload_id("wl2");
-    AddTtTask(second, "wl2_a", "nodeA", 100000);
-
-    Response reply1, reply2;
-    grpc::ServerContext context1, context2;
-    service_impl_->AddSchedInfo(&context1, &first, &reply1);
-    service_impl_->AddSchedInfo(&context2, &second, &reply2);
-    ASSERT_EQ(reply1.status(), 0);
-    ASSERT_EQ(reply2.status(), 0);
-
-    auto tables = service_impl_->GetScheduleTables();
-    EXPECT_EQ(TableTaskIds(tables.at("nodeA")),
-              std::set<std::string>({"wl1_a", "wl2_a"}));
-    EXPECT_EQ(TableTaskIds(tables.at("nodeB")),
-              std::set<std::string>({"wl1_b"}));
-}
-
-TEST_F(SchedInfoServiceTest, WorkloadWithoutNodeIdUsesDefaultNode) {
-    SchedInfo info;
-    info.set_workload_id("no_node");
-    AddTtTask(info, "t0", "", 100000);
-    AddTtTask(info, "t1", "", 100000);
-
-    Response reply;
-    grpc::ServerContext context;
-    service_impl_->AddSchedInfo(&context, &info, &reply);
-    ASSERT_EQ(reply.status(), 0);
-
-    auto tables = service_impl_->GetScheduleTables();
-    ASSERT_EQ(tables.size(), 1u);
-    EXPECT_EQ(TableTaskIds(tables.at("default")),
-              std::set<std::string>({"t0", "t1"}));
-}
-
-TEST_F(SchedInfoServiceTest, MixedNodeIdWorkloadIsRejected) {
+TEST_F(SchedInfoServiceTest, WorkloadSpanningMultipleNodesIsRejected) {
     SchedInfo base;
     base.set_workload_id("base");
     AddTtTask(base, "base_a", "nodeA", 100000);
@@ -324,38 +291,70 @@ TEST_F(SchedInfoServiceTest, MixedNodeIdWorkloadIsRejected) {
     ASSERT_EQ(base_reply.status(), 0);
     auto before = service_impl_->GetScheduleTables();
 
-    SchedInfo mixed;
-    mixed.set_workload_id("mixed");
-    AddTtTask(mixed, "with_node", "nodeA", 100000);
-    AddTtTask(mixed, "without_node", "", 100000);
+    SchedInfo spanning;
+    spanning.set_workload_id("spanning");
+    AddTtTask(spanning, "on_a", "nodeA", 100000);
+    AddTtTask(spanning, "on_b", "nodeB", 100000);
 
     Response reply;
     grpc::ServerContext context;
-    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &mixed, &reply).ok());
+    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &spanning, &reply).ok());
     EXPECT_EQ(reply.status(), -1);
 
     auto after = service_impl_->GetScheduleTables();
     ASSERT_EQ(after.size(), before.size());
+    EXPECT_EQ(after.count("nodeB"), 0u);
     EXPECT_EQ(after.at("nodeA").SerializeAsString(),
               before.at("nodeA").SerializeAsString());
 }
 
-TEST_F(SchedInfoServiceTest, RemovingSplitWorkloadEmptiesBothNodes) {
+TEST_F(SchedInfoServiceTest, WorkloadWithoutNodeIdIsRejected) {
     SchedInfo info;
-    info.set_workload_id("split_remove");
-    AddTtTask(info, "a_task", "nodeA", 100000);
-    AddTtTask(info, "b_task", "nodeB", 100000);
+    info.set_workload_id("no_node");
+    AddTtTask(info, "t0", "", 100000);
+    AddTtTask(info, "t1", "", 100000);
+
     Response reply;
     grpc::ServerContext context;
-    service_impl_->AddSchedInfo(&context, &info, &reply);
-    ASSERT_EQ(reply.status(), 0);
+    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &info, &reply).ok());
+    EXPECT_EQ(reply.status(), -1);
+    EXPECT_TRUE(service_impl_->GetScheduleTables().empty());
+}
 
-    ASSERT_TRUE(service_impl_->RemoveWorkload("split_remove"));
+TEST_F(SchedInfoServiceTest, WorkloadWithPartialNodeIdIsRejected) {
+    SchedInfo info;
+    info.set_workload_id("partial");
+    AddTtTask(info, "with_node", "nodeA", 100000);
+    AddTtTask(info, "without_node", "", 100000);
+
+    Response reply;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &info, &reply).ok());
+    EXPECT_EQ(reply.status(), -1);
+    EXPECT_TRUE(service_impl_->GetScheduleTables().empty());
+}
+
+TEST_F(SchedInfoServiceTest, RemovingWorkloadKeepsOtherNodes) {
+    SchedInfo wl_a;
+    wl_a.set_workload_id("wl_a");
+    AddTtTask(wl_a, "a_task", "nodeA", 100000);
+    SchedInfo wl_b;
+    wl_b.set_workload_id("wl_b");
+    AddTtTask(wl_b, "b_task", "nodeB", 100000);
+    for (SchedInfo* info : {&wl_a, &wl_b}) {
+        Response reply;
+        grpc::ServerContext context;
+        service_impl_->AddSchedInfo(&context, info, &reply);
+        ASSERT_EQ(reply.status(), 0);
+    }
+
+    ASSERT_TRUE(service_impl_->RemoveWorkload("wl_a"));
 
     auto tables = service_impl_->GetScheduleTables();
     ASSERT_EQ(tables.size(), 2u);
     EXPECT_EQ(tables.at("nodeA").partitions_size(), 0);
-    EXPECT_EQ(tables.at("nodeB").partitions_size(), 0);
+    EXPECT_EQ(TableTaskIds(tables.at("nodeB")),
+              std::set<std::string>({"b_task"}));
 }
 
 // Tests for SchedInfoServer
