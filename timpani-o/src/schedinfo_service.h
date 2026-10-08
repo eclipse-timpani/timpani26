@@ -60,9 +60,10 @@ class SchedInfoServiceImpl final : public SchedInfoService::Service
     // Regenerate schedule tables for all workloads on every target node
     bool RegenerateAllSchedules(std::string& error_detail);
 
-    // Per-workload classified tasks: workload_id → (target_nodes, tasks)
+    // Per-workload classified tasks: workload_id → (node_id, tasks).
+    // A workload is bound to exactly one node (DDR-001).
     struct WorkloadEntry {
-        std::set<std::string> target_nodes;
+        std::string node_id;
         std::vector<ClassifiedTask> tasks;
     };
     std::map<std::string, WorkloadEntry> workload_tasks_;

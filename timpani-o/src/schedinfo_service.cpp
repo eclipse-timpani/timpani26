@@ -86,31 +86,33 @@ Status SchedInfoServiceImpl::AddSchedInfo(ServerContext* context,
         return Status::OK;
     }
 
-    // Determine target nodes from tasks
-    std::set<std::string> target_nodes;
+    // A workload is bound to exactly one node (DDR-001): every task must
+    // carry the same, non-empty node_id.
+    std::set<std::string> node_ids;
     for (const auto& task : request->tasks()) {
-        if (!task.node_id().empty()) {
-            target_nodes.insert(task.node_id());
-        }
+        node_ids.insert(task.node_id());
     }
 
-    if (target_nodes.empty()) {
-        // If no node specified, use all configured nodes
-        if (node_config_manager_ && node_config_manager_->IsLoaded()) {
-            for (const auto& [nid, _] : node_config_manager_->GetAllNodes()) {
-                target_nodes.insert(nid);
-            }
-        }
-        if (target_nodes.empty()) {
-            target_nodes.insert("default");
-        }
+    if (node_ids.count("")) {
+        TLOG_ERROR("Workload '", request->workload_id(),
+                   "' has task(s) without node_id - rejected");
+        reply->set_status(-1);
+        return Status::OK;
+    }
+
+    if (node_ids.size() != 1) {
+        TLOG_ERROR("Workload '", request->workload_id(), "' spans ",
+                   node_ids.size(), " nodes; a workload must be bound to "
+                   "one node - rejected");
+        reply->set_status(-1);
+        return Status::OK;
     }
 
     std::unique_lock<std::shared_mutex> lock(schedule_mutex_);
 
     // Store/replace classified tasks for this workload
     WorkloadEntry entry;
-    entry.target_nodes = target_nodes;
+    entry.node_id = *node_ids.begin();
     entry.tasks = std::move(classified);
     workload_tasks_[request->workload_id()] = std::move(entry);
 
@@ -144,7 +146,7 @@ bool SchedInfoServiceImpl::RegenerateAllSchedules(std::string& error_detail)
     // so nodes with 0 remaining tasks receive an empty table.
     std::set<std::string> all_nodes;
     for (const auto& [wl_id, entry] : workload_tasks_) {
-        all_nodes.insert(entry.target_nodes.begin(), entry.target_nodes.end());
+        all_nodes.insert(entry.node_id);
     }
     for (const auto& [node_id, table] : schedule_tables_) {
         all_nodes.insert(node_id);
@@ -153,10 +155,10 @@ bool SchedInfoServiceImpl::RegenerateAllSchedules(std::string& error_detail)
     ScheduleTableMap new_tables;
 
     for (const auto& node_id : all_nodes) {
-        // Gather ALL classified tasks destined for this node
+        // Gather the classified tasks of every workload bound to this node
         std::vector<ClassifiedTask> all_tasks;
         for (const auto& [wl_id, entry] : workload_tasks_) {
-            if (entry.target_nodes.count(node_id)) {
+            if (entry.node_id == node_id) {
                 all_tasks.insert(all_tasks.end(),
                                  entry.tasks.begin(), entry.tasks.end());
             }

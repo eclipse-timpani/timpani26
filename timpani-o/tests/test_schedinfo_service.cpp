@@ -9,6 +9,8 @@
 #include <chrono>
 #include <memory>
 #include <random>
+#include <set>
+#include <string>
 
 #include "../src/tlog.h"
 #include "../src/schedinfo_service.h"
@@ -153,7 +155,7 @@ TEST_F(SchedInfoServiceTest, AddSchedInfoWithDifferentPolicies) {
     task2->set_period(2000000);
     task2->set_runtime(200000);
     task2->set_deadline(1800000);
-    task2->set_node_id("node2");
+    task2->set_node_id("node1");
 
     TaskInfo* task3 = sched_info.add_tasks();
     task3->set_name("rr_task");
@@ -222,6 +224,137 @@ TEST_F(SchedInfoServiceTest, RemoveWorkloadProducesEmptyTableForNode) {
     auto sched_tables_after = service_impl_->GetScheduleTables();
     ASSERT_NE(sched_tables_after.find("node1"), sched_tables_after.end());
     EXPECT_EQ(sched_tables_after["node1"].partitions_size(), 0);
+}
+
+// Collect TT slot task ids of a node table.
+static std::set<std::string> TableTaskIds(
+    const timpani::node::v1::HierarchicalScheduleTable& table) {
+    std::set<std::string> ids;
+    for (const auto& part : table.partitions()) {
+        for (const auto& layer : part.layers()) {
+            for (const auto& slot : layer.tt_slots()) {
+                ids.insert(slot.task_id());
+            }
+        }
+    }
+    return ids;
+}
+
+static void AddTtTask(SchedInfo& info, const std::string& name,
+                      const std::string& node_id, uint64_t period_us) {
+    TaskInfo* task = info.add_tasks();
+    task->set_name(name);
+    task->set_policy(SchedPolicy::FIFO);
+    task->set_priority(50);
+    task->set_period(period_us);
+    task->set_runtime(period_us / 10);
+    task->set_deadline(period_us);
+    task->set_node_id(node_id);
+}
+
+TEST_F(SchedInfoServiceTest, WorkloadsOnSameNodeAreMerged) {
+    SchedInfo wl1;
+    wl1.set_workload_id("wl1");
+    AddTtTask(wl1, "wl1_t0", "nodeA", 100000);
+    AddTtTask(wl1, "wl1_t1", "nodeA", 50000);
+
+    SchedInfo wl2;
+    wl2.set_workload_id("wl2");
+    AddTtTask(wl2, "wl2_t0", "nodeA", 100000);
+
+    SchedInfo wl3;
+    wl3.set_workload_id("wl3");
+    AddTtTask(wl3, "wl3_t0", "nodeB", 100000);
+
+    for (SchedInfo* info : {&wl1, &wl2, &wl3}) {
+        Response reply;
+        grpc::ServerContext context;
+        ASSERT_TRUE(service_impl_->AddSchedInfo(&context, info, &reply).ok());
+        ASSERT_EQ(reply.status(), 0) << info->workload_id();
+    }
+
+    auto tables = service_impl_->GetScheduleTables();
+    ASSERT_EQ(tables.size(), 2u);
+    EXPECT_EQ(TableTaskIds(tables.at("nodeA")),
+              std::set<std::string>({"wl1_t0", "wl1_t1", "wl2_t0"}));
+    EXPECT_EQ(TableTaskIds(tables.at("nodeB")),
+              std::set<std::string>({"wl3_t0"}));
+}
+
+TEST_F(SchedInfoServiceTest, WorkloadSpanningMultipleNodesIsRejected) {
+    SchedInfo base;
+    base.set_workload_id("base");
+    AddTtTask(base, "base_a", "nodeA", 100000);
+    Response base_reply;
+    grpc::ServerContext base_context;
+    service_impl_->AddSchedInfo(&base_context, &base, &base_reply);
+    ASSERT_EQ(base_reply.status(), 0);
+    auto before = service_impl_->GetScheduleTables();
+
+    SchedInfo spanning;
+    spanning.set_workload_id("spanning");
+    AddTtTask(spanning, "on_a", "nodeA", 100000);
+    AddTtTask(spanning, "on_b", "nodeB", 100000);
+
+    Response reply;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &spanning, &reply).ok());
+    EXPECT_EQ(reply.status(), -1);
+
+    auto after = service_impl_->GetScheduleTables();
+    ASSERT_EQ(after.size(), before.size());
+    EXPECT_EQ(after.count("nodeB"), 0u);
+    EXPECT_EQ(after.at("nodeA").SerializeAsString(),
+              before.at("nodeA").SerializeAsString());
+}
+
+TEST_F(SchedInfoServiceTest, WorkloadWithoutNodeIdIsRejected) {
+    SchedInfo info;
+    info.set_workload_id("no_node");
+    AddTtTask(info, "t0", "", 100000);
+    AddTtTask(info, "t1", "", 100000);
+
+    Response reply;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &info, &reply).ok());
+    EXPECT_EQ(reply.status(), -1);
+    EXPECT_TRUE(service_impl_->GetScheduleTables().empty());
+}
+
+TEST_F(SchedInfoServiceTest, WorkloadWithPartialNodeIdIsRejected) {
+    SchedInfo info;
+    info.set_workload_id("partial");
+    AddTtTask(info, "with_node", "nodeA", 100000);
+    AddTtTask(info, "without_node", "", 100000);
+
+    Response reply;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service_impl_->AddSchedInfo(&context, &info, &reply).ok());
+    EXPECT_EQ(reply.status(), -1);
+    EXPECT_TRUE(service_impl_->GetScheduleTables().empty());
+}
+
+TEST_F(SchedInfoServiceTest, RemovingWorkloadKeepsOtherNodes) {
+    SchedInfo wl_a;
+    wl_a.set_workload_id("wl_a");
+    AddTtTask(wl_a, "a_task", "nodeA", 100000);
+    SchedInfo wl_b;
+    wl_b.set_workload_id("wl_b");
+    AddTtTask(wl_b, "b_task", "nodeB", 100000);
+    for (SchedInfo* info : {&wl_a, &wl_b}) {
+        Response reply;
+        grpc::ServerContext context;
+        service_impl_->AddSchedInfo(&context, info, &reply);
+        ASSERT_EQ(reply.status(), 0);
+    }
+
+    ASSERT_TRUE(service_impl_->RemoveWorkload("wl_a"));
+
+    auto tables = service_impl_->GetScheduleTables();
+    ASSERT_EQ(tables.size(), 2u);
+    EXPECT_EQ(tables.at("nodeA").partitions_size(), 0);
+    EXPECT_EQ(TableTaskIds(tables.at("nodeB")),
+              std::set<std::string>({"b_task"}));
 }
 
 // Tests for SchedInfoServer
