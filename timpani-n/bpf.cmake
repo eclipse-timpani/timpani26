@@ -33,21 +33,21 @@ set(SKEL_HDR "${OutputSkel}")
 # vmlinux.h auto generation
 add_custom_command(
     OUTPUT ${VMLINUX_H}
-    COMMAND bpftool btf dump file /sys/kernel/btf/vmlinux format c > ${VMLINUX_H}
-    COMMENT "Generating vmlinux.h from running kernel BTF"
+    COMMAND "${BPFTOOL_EXECUTABLE}" btf dump file "${TIMPANI_KERNEL_BTF_FILE}" format c > "${VMLINUX_H}"
+    COMMENT "Generating vmlinux.h from target kernel BTF"
+    DEPENDS "${TIMPANI_KERNEL_BTF_FILE}"
     VERBATIM
 )
 
 add_custom_command(OUTPUT ${BPF_OBJ}
-    # We ensure BPF_INCLUDES is passed to clang
-    COMMAND clang -target bpf -g -O2 -c ${BPF_SRC} -o ${BPF_OBJ} ${BPF_INCLUDES}
+    COMMAND clang -target bpf -g -O2 -c ${BPF_SRC} -o ${BPF_OBJ} ${BPF_INCLUDES} ${BPF_EXTRA_CFLAGS}
     VERBATIM
     # Added libbpf as a dependency so headers are built before clang runs
     DEPENDS ${BPF_SRC} ${VMLINUX_H} libbpf
 )
 
 add_custom_command(OUTPUT ${SKEL_HDR}
-    COMMAND bpftool gen skeleton ${BPF_OBJ} > ${SKEL_HDR}
+    COMMAND "${BPFTOOL_EXECUTABLE}" gen skeleton ${BPF_OBJ} > ${SKEL_HDR}
     VERBATIM
     DEPENDS ${BPF_OBJ}
 )
