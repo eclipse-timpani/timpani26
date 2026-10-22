@@ -6,7 +6,12 @@ cmake_minimum_required(VERSION 3.5)
 # Find required packages
 find_package(PkgConfig REQUIRED)
 find_package(Protobuf REQUIRED)
-find_package(gRPC REQUIRED)
+if(NOT TARGET gRPC::grpc++)
+    pkg_search_module(GRPC REQUIRED IMPORTED_TARGET grpc)
+    pkg_search_module(GRPCPP REQUIRED IMPORTED_TARGET grpc++)
+    add_library(gRPC::grpc ALIAS PkgConfig::GRPC)
+    add_library(gRPC::grpc++ ALIAS PkgConfig::GRPCPP)
+endif()
 
 # Find Google Test and Google Mock
 find_package(GTest REQUIRED)
@@ -142,6 +147,58 @@ add_test(NAME NodeConfigTest COMMAND test_node_config)
 
 # Set test properties for NodeConfig test
 set_tests_properties(NodeConfigTest PROPERTIES
+    TIMEOUT 30
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+# Create RecoveryService test executable
+add_executable(test_recovery_service
+    test_recovery_service.cpp
+    ../src/recovery_service.cpp
+    ../src/schedinfo_service.cpp
+    ../src/node_config.cpp
+    ../src/global_scheduler.cpp
+    ../src/orchestrator_service.cpp
+    ../src/fault_client.cpp
+)
+
+target_link_libraries(test_recovery_service
+    GTest::gtest
+    GTest::gtest_main
+    gRPC::grpc++
+    protobuf::libprotobuf
+    schedinfo_proto
+    node_control_proto
+    pthread
+)
+
+add_test(NAME RecoveryServiceTest COMMAND test_recovery_service)
+
+set_tests_properties(RecoveryServiceTest PROPERTIES
+    TIMEOUT 30
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+# Create OrchestratorService test executable
+add_executable(test_orchestrator_service
+    test_orchestrator_service.cpp
+    ../src/orchestrator_service.cpp
+    ../src/fault_client.cpp
+)
+
+target_link_libraries(test_orchestrator_service
+    GTest::gtest
+    GTest::gtest_main
+    gRPC::grpc++
+    protobuf::libprotobuf
+    schedinfo_proto
+    node_control_proto
+    pthread
+)
+
+add_test(NAME OrchestratorServiceTest COMMAND test_orchestrator_service)
+
+set_tests_properties(OrchestratorServiceTest PROPERTIES
     TIMEOUT 30
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
