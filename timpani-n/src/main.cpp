@@ -57,7 +57,7 @@ struct timpani_sched_attr {
 };
 
 /**
- * apply_sched_ext() - Set SCHED_EXT policy on a task via pid.
+ * apply_sched_ext() - Set SCHED_EXT policy on a task via pid (or tid).
  *
  * Called from table_callback after update_task_meta() so that
  * scx_timpani (SCX_OPS_SWITCH_PARTIAL) takes ownership of the task.
@@ -65,14 +65,14 @@ struct timpani_sched_attr {
  *
  * Required: timpani-n runs with CAP_SYS_NICE (setuid or systemd capability).
  */
-static int apply_sched_ext(pid_t pid)
+static int apply_sched_ext(pid_t pid, const char* id_kind = "pid")
 {
     struct timpani_sched_attr attr = {};
     attr.size        = sizeof(attr);
     attr.sched_policy = SCHED_EXT;
     if (syscall(SYS_sched_setattr, pid, &attr, 0) < 0) {
         int saved = errno;
-        std::cerr << "[main] sched_setattr(SCHED_EXT) failed for pid=" << pid
+        std::cerr << "[main] sched_setattr(SCHED_EXT) failed for " << id_kind << "=" << pid
                   << ": " << strerror(saved) << std::endl;
         return -1;
     }
@@ -242,6 +242,71 @@ static pid_t find_pid_by_comm(const std::string& comm)
     }
     closedir(proc);
     return found;
+}
+
+/**
+ * @brief Search /proc for a thread with matching comm name (DDR-005).
+ * @param comm  Task comm name (up to 15 chars as in /proc/<pid>/task/<tid>/comm)
+ * @return TID on success (equals PID for a main thread), -1 if not found
+ */
+static pid_t find_tid_by_comm(const std::string& comm)
+{
+    DIR* proc = opendir("/proc");
+    if (!proc) return -1;
+
+    // comm is truncated to 15 chars in the kernel
+    const std::string cmp_comm = comm.substr(0, 15);
+    auto is_numeric = [](const char* s) {
+        if (*s == '\0') return false;
+        for (; *s; ++s)
+            if (!std::isdigit(static_cast<unsigned char>(*s))) return false;
+        return true;
+    };
+
+    struct dirent* entry;
+    pid_t found = -1;
+    while (found < 0 && (entry = readdir(proc)) != nullptr) {
+        if (entry->d_type != DT_DIR || !is_numeric(entry->d_name)) continue;
+
+        const std::string task_dir =
+            std::string("/proc/") + entry->d_name + "/task";
+        DIR* tasks = opendir(task_dir.c_str());
+        if (!tasks) continue;
+
+        struct dirent* tent;
+        while ((tent = readdir(tasks)) != nullptr) {
+            if (!is_numeric(tent->d_name)) continue;
+
+            std::ifstream f(task_dir + "/" + tent->d_name + "/comm");
+            if (!f.is_open()) continue;
+
+            std::string thread_comm;
+            std::getline(f, thread_comm);
+            if (thread_comm == cmp_comm || thread_comm == comm) {
+                found = static_cast<pid_t>(std::stoi(tent->d_name));
+                break;
+            }
+        }
+        closedir(tasks);
+    }
+    closedir(proc);
+    return found;
+}
+
+/**
+ * @brief Resolve a task name to the id timpani-n schedules.
+ *
+ * A process whose main thread carries the task name (e.g. sample_apps) is
+ * returned as its PID; otherwise a named worker thread is returned as its TID.
+ * Either way the value is the kernel pid used as the key of task_meta_map.
+ * @param is_thread  Set to true when the match is a worker thread (TID), false for a process (PID)
+ * @return PID or TID, -1 if no process or thread has that name
+ */
+static pid_t find_task_by_comm(const std::string& comm, bool& is_thread)
+{
+    pid_t id = find_pid_by_comm(comm);
+    is_thread = (id < 0);
+    return is_thread ? find_tid_by_comm(comm) : id;
 }
 
 int main(int argc, char** argv)
@@ -630,7 +695,9 @@ int main(int argc, char** argv)
                     for (const auto& tt_slot : layer.tt_slots()) {
                         // Apply SCHED_FIFO + affinity to matching process
                         const std::string& task_id = tt_slot.task_id();
-                        pid_t pid = find_pid_by_comm(task_id);
+                        bool is_thread = false;
+                        pid_t pid = find_task_by_comm(task_id, is_thread);
+                        const char* id_kind = is_thread ? "tid" : "pid";
                         if (pid < 0) {
                             std::cerr
                                 << "[main] Task not found in /proc: " << task_id
@@ -670,7 +737,7 @@ int main(int argc, char** argv)
                             if (bpf_loader.update_task_meta(
                                     static_cast<uint32_t>(pid), meta)) {
                                 std::cout << "[main] Registered task in BPF: "
-                                          << task_id << " pid=" << pid
+                                          << task_id << " " << id_kind << "=" << pid
                                           << " type=TT hash=0x" << std::hex
                                           << meta.task_id_hash << std::dec
                                           << std::endl;
@@ -678,16 +745,16 @@ int main(int argc, char** argv)
                                  * On timpani-n restart scx unload demotes
                                  * SCHED_EXT tasks to SCHED_OTHER; re-apply
                                  * here so select_cpu()/enqueue() fire. */
-                                if (apply_sched_ext(pid) == 0) {
+                                if (apply_sched_ext(pid, id_kind) == 0) {
                                     std::cout << "[main] Applied SCHED_EXT to "
-                                              << task_id << " pid=" << pid
+                                              << task_id << " " << id_kind << "=" << pid
                                               << std::endl;
                                 }
                             } else {
                                 std::cerr
                                     << "[main] Failed to register task in "
                                        "BPF task_meta_map: "
-                                    << task_id << " pid=" << pid << std::endl;
+                                    << task_id << " " << id_kind << "=" << pid << std::endl;
                                 record_apply_error("TT task_meta update failed: " +
                                                    task_id);
                             }
@@ -751,7 +818,9 @@ int main(int argc, char** argv)
 
                     for (const auto& cbs_entry : layer.cbs_entries()) {
                         const std::string& task_id = cbs_entry.task_id();
-                        pid_t pid = find_pid_by_comm(task_id);
+                        bool is_thread = false;
+                        pid_t pid = find_task_by_comm(task_id, is_thread);
+                        const char* id_kind = is_thread ? "tid" : "pid";
                         if (pid < 0) {
                             std::cerr << "[main] CBS task not found in /proc: "
                                       << task_id << std::endl;
@@ -788,15 +857,15 @@ int main(int argc, char** argv)
                                 static_cast<uint32_t>(pid), meta)) {
                             std::cerr << "[main] Failed to register CBS task "
                                          "in BPF task_meta_map: "
-                                      << task_id << " pid=" << pid << std::endl;
+                                      << task_id << " " << id_kind << "=" << pid << std::endl;
                             record_apply_error("CBS task_meta update failed: " +
                                                task_id);
                             continue;
                         }
 
-                        if (apply_sched_ext(pid) == 0) {
+                        if (apply_sched_ext(pid, id_kind) == 0) {
                             std::cout << "[main] Applied SCHED_EXT to CBS "
-                                      << task_id << " pid=" << pid << std::endl;
+                                      << task_id << " " << id_kind << "=" << pid << std::endl;
                         }
 
                         CbsState cbs_state = {};
@@ -825,7 +894,7 @@ int main(int argc, char** argv)
                         }
 
                         std::cout << "[main] Registered CBS task in BPF: "
-                                  << task_id << " pid=" << pid << " cpu="
+                                  << task_id << " " << id_kind << "=" << pid << " cpu="
                                   << partition_cpu << " budget="
                                   << cbs_state.budget_us << "us period="
                                   << cbs_state.period_us << "us hash=0x"
