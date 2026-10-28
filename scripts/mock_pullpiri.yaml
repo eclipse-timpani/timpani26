@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+# SPDX-License-Identifier: MIT
+
+workloads:
+  - workload_id: fcw_producer_tt
+    temporal_class: TEMPORAL_PERIODIC
+    tasks:
+      - name: tt_task
+        priority: 20
+        policy: FIFO
+        cpu_affinity: 0x1
+        period: 20000
+        runtime: 2000
+        deadline: 20000
+        release_time: 0
+        max_dmiss: 2
+
+  - workload_id: verify_wl_cbs
+    temporal_class: TEMPORAL_SPORADIC
+    tasks:
+      - name: cbs_task
+        priority: 18
+        policy: FIFO
+        cpu_affinity: 0x1
+        period: 20000
+        runtime: 2000
+        deadline: 5000
+        release_time: 0
+        max_dmiss: 2
+
