@@ -13,6 +13,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <unistd.h>
@@ -45,6 +46,12 @@ std::unordered_map<uint64_t, EventContract> g_contracts;
 
 thread_local uint64_t g_current_cbs_key = 0;
 thread_local int g_current_cbs_slot = -1;
+
+/* Per-event traces (arrival/bind/unbind) are noisy at 50 Hz; enable with TIMPANI_RT_VERBOSE=1. */
+bool verbose() {
+    static const bool v = [] { const char* e = getenv("TIMPANI_RT_VERBOSE"); return e && *e && *e != '0'; }();
+    return v;
+}
 
 uint64_t monotonic_now_ns() {
     struct timespec ts;
@@ -199,12 +206,10 @@ int timpani_evt_register(
         g_contracts[event_key] = EventContract{cbs_key, static_cast<uint64_t>(mit_us) * 1000ULL, 0};
     }
 
-    std::cout << "[libtimpani_rt] timpani_evt_register: Registered L2 Contract" << std::endl;
-    std::cout << "  - Workload/Task: \"" << workload_id << "\" / \"" << task_id << "\"" << std::endl;
-    std::cout << "  - cbs_key:       0x" << std::hex << cbs_key << " (\"" << cbs_str << "\")" << std::endl;
-    std::cout << "  - Service/Inst/Evt: 0x" << service_id << " / 0x" << instance_id << " / 0x" << event_id << std::endl;
-    std::cout << "  - event_key:     0x" << event_key << " (\"" << event_str << "\")" << std::dec << std::endl;
-    std::cout << "  - mit:           " << mit_us << " us" << std::endl;
+    std::cout << "[libtimpani_rt] L2 contract registered: " << workload_id << "/" << task_id
+              << " event " << service_id << "/" << instance_id << "/" << event_id
+              << " mit=" << mit_us << "us (cbs_key=0x" << std::hex << cbs_key
+              << " event_key=0x" << event_key << std::dec << ")" << std::endl;
     
     return 0;
 }
@@ -254,12 +259,14 @@ int timpani_evt_mark_arrival(
         if (violated) emit_mit_violation(event_key, interval_ns, mit_ns);
     }
 
-    std::cout << "[libtimpani_rt] timpani_evt_mark_arrival: event_key = 0x" << std::hex << event_key 
-              << " (\"" << event_str << "\")" << std::dec 
-              << ", seq = " << seq 
-              << ", timestamp = " << now_ns << " ns (t0 마킹)" << std::endl;
+    if (verbose()) {
+        std::cout << "[libtimpani_rt] timpani_evt_mark_arrival: event_key = 0x" << std::hex << event_key
+                  << " (\"" << event_str << "\")" << std::dec
+                  << ", seq = " << seq
+                  << ", timestamp = " << now_ns << " ns (t0)" << std::endl;
+    }
     if (violated) {
-        std::cout << "[libtimpani_rt] timpani_evt_mark_arrival: MIT VIOLATION interval="
+        std::cout << "[libtimpani_rt] FAULT MIT_VIOLATION seq=" << seq << " interval="
                   << (interval_ns / 1000) << "us < mit=" << (mit_ns / 1000) << "us -> fault_rb" << std::endl;
     }
 
@@ -308,13 +315,15 @@ int timpani_cbs_bind_thread(const char* workload_id, const char* task_id) {
     const bool e2e_exceeded = e2e_event_key != 0 && e2e_ns > E2E_LATENCY_LIMIT_NS;
     if (e2e_exceeded) emit_fault(TIMPANI_FAULT_E2E_EXCEED, e2e_event_key, e2e_ns, E2E_LATENCY_LIMIT_NS);
 
-    std::cout << "[libtimpani_rt] timpani_cbs_bind_thread: bound TID = " << tid 
-              << " to cbs_key = 0x" << std::hex << cbs_key << std::dec 
-              << " (\"" << cbs_str << "\")"
-              << (slot >= 0 ? (" [shm cbs.slots[" + std::to_string(slot) + "]]") : std::string(" [shm unavailable]"))
-              << std::endl;
+    if (verbose()) {
+        std::cout << "[libtimpani_rt] timpani_cbs_bind_thread: bound TID = " << tid
+                  << " to cbs_key = 0x" << std::hex << cbs_key << std::dec
+                  << " (\"" << cbs_str << "\")"
+                  << (slot >= 0 ? (" [shm cbs.slots[" + std::to_string(slot) + "]]") : std::string(" [shm unavailable]"))
+                  << std::endl;
+    }
     if (e2e_exceeded) {
-        std::cout << "[libtimpani_rt] timpani_cbs_bind_thread: WAKEUP/E2E LATENCY EXCEEDED t1-t0="
+        std::cout << "[libtimpani_rt] FAULT E2E_LATENCY_EXCEEDED t1-t0="
                   << (e2e_ns / 1000) << "us > limit=" << (E2E_LATENCY_LIMIT_NS / 1000) << "us -> fault_rb" << std::endl;
     }
               
@@ -335,8 +344,9 @@ int timpani_cbs_unbind_thread(void) {
     g_current_cbs_slot = -1;
     g_current_cbs_key = 0;
 
-    std::cout << "[libtimpani_rt] timpani_cbs_unbind_thread: unbound TID = " << tid 
-              << " (cbs_tid_map 에서 TID 엔트리 안전 제거)" << std::endl;
+    if (verbose()) {
+        std::cout << "[libtimpani_rt] timpani_cbs_unbind_thread: unbound TID = " << tid << std::endl;
+    }
     return 0;
 }
 
@@ -352,4 +362,3 @@ int timpani_cbs_register_socket(
 }
 
 }
-

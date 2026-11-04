@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <vector>
 #include <iomanip>
+#include <cmath>
 #include "calc_workload.h"
 
 /* Same real-time signal number as sample-apps/src/sample_apps.h's SIGNO_TT,
@@ -25,6 +26,16 @@
 /* Radar-side detection range; must exceed the FCW alarm-off distance (18 m) so the
  * consumer still receives the events it needs to clear the alarm. */
 #define ALERT_RANGE_M 15.0f
+
+#define TT_WCET_MS 2.0
+#define TT_DEADLINE_MS 20.0
+#define TT_JITTER_LIMIT_MS 1.0 /* L1 execution-jitter target */
+
+static uint64_t clock_ns(clockid_t id) {
+    struct timespec ts;
+    clock_gettime(id, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+}
 
 static std::shared_ptr<vsomeip::application> app;
 static std::atomic<bool> run_producer{true};
@@ -123,13 +134,16 @@ int main(int argc, char* argv[]) {
             its.it_interval = its.it_value;
             timer_settime(local_timer, 0, &its, nullptr);
         } else {
-            std::cout << "[mock_radar_producer] Using ttsched futex wakeup (/timpani_ttsched SHM)..." << std::endl;
+            std::cout << "[radar] Using ttsched futex wakeup (/timpani_ttsched SHM)..." << std::endl;
         }
+        std::cout << "[radar] per frame: period = wake-to-wake, jitter = period - " << interval_ms
+                  << " ms, cpu = CPU time used, resp = wake->published" << std::endl;
 
         uint32_t seq = 0;
         float distance = 30.0f;
         float direction = -1.0f; // Approaching
         bool in_alert_range = false;
+        uint64_t prev_wake_ns = 0;
 
         while (run_producer) {
             if (burst_mode) {
@@ -138,6 +152,8 @@ int main(int argc, char* argv[]) {
             } else if (ttsched_wait_next_period() != 0) {
                 continue; // SHM/slot not ready: skip the period, same as sample_apps -b
             }
+            const uint64_t wake_ns = clock_ns(CLOCK_MONOTONIC);
+            const uint64_t cpu0_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID);
 
             // Simulated per-period computation that must be scheduled/budgeted
             // by timpani-n (sched_ext), standing in for the workload's runtime.
@@ -149,11 +165,11 @@ int main(int argc, char* argv[]) {
             if (distance <= 4.0f) {
                 distance = 4.0f;
                 direction = 1.0f; // Target starts moving away
-                std::cout << "[mock_radar_producer] Target closest. Reversing direction." << std::endl;
+                std::cout << "[radar] Target closest. Reversing direction." << std::endl;
             } else if (distance >= 35.0f) {
                 distance = 35.0f;
                 direction = -1.0f; // Target starts approaching
-                std::cout << "[mock_radar_producer] Target furthest. Reversing direction." << std::endl;
+                std::cout << "[radar] Target furthest. Reversing direction." << std::endl;
             }
 
             // 2. Radar detects the obstacle alert; only detections are sent to FCW
@@ -167,8 +183,8 @@ int main(int argc, char* argv[]) {
             const bool detected = (distance < ALERT_RANGE_M);
             if (detected != in_alert_range) {
                 in_alert_range = detected;
-                std::cout << (detected ? "[mock_radar_producer] Obstacle within alert range -> publishing ObstacleAlert."
-                                       : "[mock_radar_producer] Obstacle cleared alert range -> publishing stopped.")
+                std::cout << (detected ? "[radar] Obstacle within alert range -> publishing ObstacleAlert."
+                                       : "[radar] Obstacle cleared alert range -> publishing stopped.")
                           << std::endl;
             }
             // 3. Notify subscribers only for detections
@@ -178,11 +194,24 @@ int main(int argc, char* argv[]) {
                 app->notify(service_id, instance_id, event_id, payload);
             }
 
-            std::cout << "[mock_radar_producer] Frame #" << target.seq 
-                      << " | Target ID: " << target.id 
-                      << " | Distance: " << std::fixed << std::setprecision(2) << target.distance_meters << " m"
-                      << " | Velocity: " << target.velocity_mps << " m/s"
-                      << (detected ? " | ObstacleAlert published" : " | no alert") << std::endl;
+            const double cpu_ms = (clock_ns(CLOCK_THREAD_CPUTIME_ID) - cpu0_ns) / 1e6;
+            const double resp_ms = (clock_ns(CLOCK_MONOTONIC) - wake_ns) / 1e6;
+            const bool have_period = prev_wake_ns != 0;
+            const double period_ms = have_period ? (wake_ns - prev_wake_ns) / 1e6 : 0.0;
+            const double jitter_ms = have_period ? period_ms - interval_ms : 0.0;
+            prev_wake_ns = wake_ns;
+
+            std::cout << "[radar] frame " << std::setw(5) << target.seq
+                      << " | " << std::fixed << std::setprecision(2) << std::setw(5) << target.distance_meters << " m"
+                      << " | " << (detected ? "PUBLISH" : "-      ")
+                      << " | period " << std::setw(6) << period_ms << " ms"
+                      << " | jitter " << std::showpos << std::setw(6) << jitter_ms << std::noshowpos << " ms"
+                      << " | cpu " << std::setw(5) << cpu_ms << " ms"
+                      << " | resp " << std::setw(6) << resp_ms << " ms"
+                      << (std::abs(jitter_ms) > TT_JITTER_LIMIT_MS ? " | JITTER" : "")
+                      << (cpu_ms > TT_WCET_MS ? " | OVER_WCET" : "")
+                      << (resp_ms > TT_DEADLINE_MS ? " | DEADLINE_MISS" : "")
+                      << std::endl;
         }
     });
 
@@ -195,4 +224,3 @@ int main(int argc, char* argv[]) {
     std::cout << "[mock_radar_producer] Producer terminated." << std::endl;
     return 0;
 }
-
