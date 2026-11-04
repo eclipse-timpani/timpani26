@@ -18,8 +18,8 @@
 #include <cctype>
 #include "calc_workload.h"
 
-/* CPU time of an injected overrun: 3x the 2 ms CBS budget, past the 5 ms deadline once throttled. */
-#define FCW_BUDGET_EXCEED_MS 6
+/* Injected CPU time: above the 2 ms CBS budget but below the 5 ms deadline, so an unthrottled run is budget-exceeded only. */
+#define FCW_BUDGET_EXCEED_MS 3
 #define FCW_BUDGET_EXCEED_DEFAULT_EVERY 30
 #define FCW_CBS_BUDGET_MS 2.0
 #define FCW_CBS_DEADLINE_MS 5.0
@@ -175,7 +175,7 @@ int main(int argc, char* argv[]) {
                       << "  -h, --help        Show help\n"
                       << "  --overrun-ms <ms> Simulate thread execution overhead (Default 0ms. Set >2 to test Throttling)\n"
                       << "  --wakeup-delay-ms <ms> Delay before CBS bind to exceed the 3ms wakeup-latency limit\n"
-                      << "  -be, --budgetexceed [N] Every Nth processed event (default 30) burns 6 ms CPU instead of ~1.5 ms\n";
+                      << "  -be, --budgetexceed [N] Every Nth processed event (default 30) burns 3 ms CPU instead of ~1.5 ms\n";
             return 0;
         }
     }
