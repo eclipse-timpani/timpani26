@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 # LLD-008: Event-Driven Workload Support — 상세 설계 (Low-Level Design)
 
 **날짜:** 2026-11-10
-**상태:** Draft (v1, Phase 1 범위) — DDR-008(Proposal)의 D-01~D-17 확정을 전제로 함
+**상태:** Draft (v2 — 공통 Event/Job 모델 반영, Phase 1 범위) — DDR-008(Proposal)의 D-01~D-17 확정을 전제로 함
 **작성:** Human + AI
 **상위 문서:** [REQ-008](REQ-008-event-driven-workload-support.md), [SRS-008](SRS-008-event-driven-workload-support.md), [DDR-008](DDR-008-event-driven-workload-support.md), [HLD-008](HLD-008-event-driven-workload-support.md)
 **기준 코드:** `timpani26` HEAD `4201573` (`timpani-o/`, `timpani-n/`, `sample-apps/`, `examples/someip/`)
@@ -21,8 +21,9 @@ SPDX-License-Identifier: MIT
 - **proto**: `schedinfo.TaskInfo.min_inter_arrival_us=11`, `FaultType` 3종 추가, `FaultInfo` 3필드 추가; `node_control.CbsConfig.min_inter_arrival_us=9, cpu=10`, `FaultType` 2종 추가, `FaultInfo` 3필드 추가. 발행 규칙: L2는 `EVENT_DRIVEN` 레이어(`layer_index=2`).
 - **timpani-o**: `ClassifiedTask.mit_us` 분리, `validate_l2_task()`, `compute_tt_blocking()`, `admit_l2_fifo()`(이용률+min-gap 거부+FIFO 블로킹 합), 전역 hyperperiod 일관화, 2-레이어 `build_table()`, 거부 시 복원, 폴트 유형 보존 매핑.
 - **BPF**: `TaskMeta` 확장(job 상태·시퀀스·플래그), CPU별 DSQ(`0x100+cpu`/`0x200+cpu`), 신규 `runnable/quiescent/exit_task` 콜백, MIT 검사, `BUDGET_EXCEED` 전이 발행, ns 누산 차감, `job_trace_rb`, `timpani_replenish_kick`(SYSCALL).
-- **timpani-n**: `TaskRegistry` 재설계(미해결 목록·재스캔·종료 감지), 신규 `Replenisher`, 신규 `JobTraceCollector`, `FaultMonitor` 집계 확장, `TimerMaster` SHM v2, `main.cpp` 테이블 적용 분기.
-- **libttsched v2**: SHM v2 레이아웃(64 슬롯, `kind/t_arr_ns/job_seq`), `ttsched_evt_wait()`, `ttsched_evt_signal()`.
+- **timpani-n**: `TaskRegistry` 재설계(미해결 목록·재스캔·종료 감지), 신규 `Replenisher`, 신규 `JobTraceCollector`, 신규 `EventSourceMonitor`, `FaultMonitor` 집계 확장, `TimerMaster` SHM v2, `main.cpp` 테이블 적용 분기.
+- **공통 모델 대응**: REQ-008 §2의 Event source·Event·Job과 생명주기 사건을 코드 요소에 1:1로 대응시킨다(§1.1). 관측 어댑터 K = BPF job FSM, M = `libttsched` + SHM EVT 슬롯 + `EventSourceMonitor`.
+- **libttsched v2**: SHM v2 레이아웃(64 슬롯, 슬롯 = Event source 상태 `event_seq/consumed_seq/last_arr_ns/mit_us/mit_viol_count`), `ttsched_evt_open()`, `ttsched_evt_notify()`(도달 통지·도달 기준 MIT), `ttsched_evt_wait()`(배치 소비 수 반환).
 - **샘플**: `sample-apps/src/evttask.c` 신규(전송 계층 중립 L2 생성기), FCW 어댑터 축소.
 - 테스트: timpani-o GTest 추가, **timpani-n GTest 타깃 신설**, BPF 상태 머신은 공용 헤더 `job_fsm.h`로 호스트 테스트.
 
@@ -36,12 +37,31 @@ SPDX-License-Identifier: MIT
 | TIMPANI-O | FR-O-001/003/005/010~016/020 | §3 |
 | BPF | FR-B-001~006/010~017/020~023 | §4 |
 | TIMPANI-N | FR-N-002~007/010~015/020~022/024 | §5 |
-| 라이브러리 | FR-L-001~006, IF-L-001~003 | §6 |
+| 공통 모델·3층 | FR-G-001/002 | §1.1 |
+| 라이브러리 | FR-L-001~008, IF-L-001~003 | §6 |
 | 샘플 앱 | FR-G-001, FR-L-006 | §7 |
 | 타이밍 | TMG-001~013 | §8 |
-| 검증 인터페이스 | IF-V-001~003 | §5.4, §10 |
+| 검증 인터페이스 | IF-V-001~004, FR-N-026 | §5.4, §10 |
 | 비기능 | NFR-001(용량), NFR-002(BPF 반복 상한), NFR-003(TT 무회귀), NFR-005(proto 호환) | §4.2, §4.5, §8, §2.3 |
 | 테스트 | NFR-006/007, AC-008-* | §10 |
+
+### 1.1 공통 모델 ↔ 구현 요소 대응
+
+| 모델 요소 (REQ-008 §2) | 구현 요소 | 어댑터 | 절 |
+|:--|:--|:-:|:--|
+| Event source (식별자, MIT, 소비 태스크) | `CbsConfig{task_id, min_inter_arrival_us}` → SHM EVT 슬롯(`name`, `mit_us`) / `TaskMeta.mit_us` | — | §2.2, §5.6, §4.1 |
+| Event `(source, event_seq, t_arr)` | 슬롯 `counter`(= `event_seq`)의 1 증가, `last_arr_ns` | M | §6 |
+| **Arrival** | `ttsched_evt_notify()` | M | §6.2 |
+| 미결(pending) Event (R2) | `counter − consumed_seq` | M | §6.2, §5.4 |
+| **Activation** (R1) | `ops.runnable`에서 `JOB_WAITING → JOB_ACTIVE`, `activation_ns`, `job_seq++` | K | §4.3, §4.4 |
+| **Start** | `ops.running`에서 `t_start_ns` 최초 기록 | K | §4.4 |
+| **Completion** | `ops.quiescent(SCX_DEQ_SLEEP)`에서 `JOB_ACTIVE → JOB_WAITING` | K | §4.3, §4.4 |
+| back-to-back Job (R3) | `ttsched_evt_wait()`가 수면 없이 복귀. K는 병합 관측(P1) | M / K | §6.2, §4.5 |
+| `n_events` (R4) | `ttsched_evt_wait()` 반환값 | M | §6.2 |
+| MIT 위반 | 도달 기준: 슬롯 `mit_viol_count`(notify) / 활성화 기준: `FAULT_MIT_VIOLATION`(BPF) | M / K | §6.2, §4.3, §5.5 |
+| Job 레코드 | `JobRecord`(`job_trace_rb`) | K | §4.1, §5.4 |
+| Event source 통계 | `EventSourceSnapshot`(100 ms 폴링) | M | §5.4 |
+| 집행(CBS·CPU 고정·DMISS) | `cbs_map`, CPU별 DSQ, `job_fsm_on_quiescent` — K의 사건만 사용 | K | §4 |
 
 ---
 
@@ -341,7 +361,7 @@ static schedinfo::v1::FaultType map_fault_type(node::v1::FaultType t) {
 #define JOB_FLAG_MIT_VIOLATION (1u << 0)
 #define JOB_FLAG_THROTTLED     (1u << 1)
 #define JOB_FLAG_EARLY_DMISS   (1u << 2)
-#define JOB_FLAG_MARKER        (1u << 3)   /* set by JobTraceCollector (userspace) when the task's SHM slot is kind==EVT; never set in BPF */
+#define JOB_FLAG_MARKER        (1u << 3)   /* set by JobTraceCollector (userspace) when the task's Event source is marker-active (EventSourceMonitor); never set in BPF */
 #define JOB_FLAG_DMISS         (1u << 4)
 #define JOB_FLAG_TASK_EXIT     (1u << 5)   /* JobRecord only: task exited */
 
@@ -468,7 +488,7 @@ static __always_inline void job_fsm_on_runnable(struct TaskMeta *m, __u64 now, s
     m->activation_ns = now; m->t_start_ns = 0; m->budget_used_us = 0; m->job_flags = 0; m->job_seq++;
     if (m->last_act_ns && m->mit_us) {
         __u64 mit_ns = (__u64)m->mit_us * 1000ULL;
-        if (now - m->last_act_ns < mit_ns) {                  /* MIT violation (FR-B-006) */
+        if (now - m->last_act_ns < mit_ns) {                  /* activation-based MIT check: adapter K approximation (FR-B-006); arrival-based count lives in libttsched */
             m->job_flags |= JOB_FLAG_MIT_VIOLATION; m->mit_viol_count++;
             ev->emit_fault = 1; ev->fault_type = FAULT_MIT_VIOLATION;
             ev->expected_ns = m->last_act_ns + mit_ns; ev->actual_ns = now;
@@ -666,6 +686,7 @@ struct sched_ext_ops timpani_ops = {
 - `promote_throttled_if_replenished` 반복 상한 `PROMOTE_BUDGET=16` 유지(SRS NFR-002).
 - `timpani_replenish_kick`의 `scx_bpf_kick_cpu` 호출 가능 여부는 커널 kfunc 등록 집합에 의존 → **OI-9 PoC**. 불가 시 §5.3 `KickBackend::KickerThreads`.
 - `job_fsm.h`는 `__always_inline`·고정폭 타입만 사용하며 `bpf_helpers.h` 미포함 → 호스트 컴파일 가능.
+- 어댑터 K의 관측 한계(REQ-008 §2.4): 미결 Event로 `ttsched_evt_wait()`가 수면 없이 복귀하면(R3) `quiescent`가 호출되지 않으므로 back-to-back Job은 하나의 구간으로 병합된다. `job_seq`는 커널이 관측한 구간 수이며, Event 수와의 대조는 `EventSourceSnapshot`으로 한다. 병합 구간의 DMISS 판정은 보수적이다. 정밀 관측은 P2(L-7).
 
 ---
 
@@ -706,10 +727,11 @@ else                                             timer_master.set_schedule_table
 replenisher.set_servers(servers);
 registry.start_rescan_if_pending();
 job_trace.set_task_names(hash → name);                     // for CSV output
+event_sources.set_shm(timer_master.shm(), key → slot);     // adapter M stats: baseline of cumulative counters
 node_client.send_table_applied(table.table_id(), apply_success, apply_error);
 ```
 
-제거/STOP 경로(`RecoverySignal`, 테이블 소멸)는 기존 처리에 더해 `replenisher.remove(key)`, `fault_monitor.clear_task(key)`, `job_trace.clear_task(key)`, `registry.remove_expected(name)`, `sched_setattr(tid, SCHED_OTHER)`을 수행한다(FR-N-005).
+제거/STOP 경로(`RecoverySignal`, 테이블 소멸)는 기존 처리에 더해 `replenisher.remove(key)`, `fault_monitor.clear_task(key)`, `job_trace.clear_task(key)`, `event_sources.clear_task(key)`, `registry.remove_expected(name)`, `sched_setattr(tid, SCHED_OTHER)`을 수행한다(FR-N-005).
 
 ### 5.2 `task_registry.{h,cpp}` — 재설계
 
@@ -787,7 +809,9 @@ void Replenisher::kick(const Server& s) {
 
 `BpfLoader` 추가 API: `bool lookup_cbs_state(uint64_t, CbsState*)`, `int run_replenish_kick(const ReplenishKickArgs&)`, `bool apply_replenish_userspace(uint64_t key, uint64_t now)`, `int get_job_trace_rb_fd()`, `bool set_trace_enabled(bool)`(bss 맵 쓰기), `bool lookup_task_meta(uint32_t, TaskMeta*)`.
 
-### 5.4 `job_trace.{h,cpp}` — 신규 `JobTraceCollector`
+### 5.4 `job_trace.{h,cpp}`, `event_source_monitor.{h,cpp}` — 신규 수집기
+
+**(a) `JobTraceCollector` — 어댑터 K의 Job 레코드**
 
 ```cpp
 class JobTraceCollector {
@@ -798,24 +822,58 @@ public:
                        Hist response, wake; uint64_t last_budget_used_us; };
     JobTraceCollector(BpfLoader& bpf, const std::string& node_id);
     void set_task_names(std::map<uint64_t, std::string> hash_to_name);
-    void set_shm(volatile struct timpani_ttsched_shm* shm, std::map<uint64_t,int> hash_to_slot);  // t_arr/job_seq merge
+    void set_marker_active(uint64_t key, bool active);        // from EventSourceMonitor → JOB_FLAG_MARKER on that task's records
     void set_enabled(bool);                                   // writes trace_enabled; opens/closes CSV sink
     void set_on_task_exit(std::function<void(uint64_t task_hash)>);
     void add_tt_jitter_sample(uint32_t cpu, uint32_t slot_idx, uint64_t target_ns, uint64_t actual_ns);   // from TimerMaster
+    void add_source_snapshot(const EventSourceSnapshot& s);   // from EventSourceMonitor
     const TaskStats& stats(uint64_t key) const;
     void clear_task(uint64_t key);
     void start(); void stop();
 private:
     static int rb_cb(void* ctx, void* data, size_t len);   // JobRecord → stats + CSV line
-    // CSV: "job,<node>,<wl_hash>,<task>,<job_seq>,<t_arr>,<t_act>,<t_start>,<t_done>,<cpu>,<budget_used_us>,<flags>"
+    // CSV: "job,<node>,<wl_hash>,<task>,<job_seq>,<t_act>,<t_start>,<t_done>,<cpu>,<budget_used_us>,<flags>"
+    //      "src,<node>,<wl_hash>,<task>,<event_seq>,<consumed_seq>,<pending>,<mit_violations>,<last_t_arr>,<t_sample>"
     //      "tt,<node>,<cpu>,<slot_idx>,<target_ns>,<actual_ns>,<jitter_ns>"
 };
 ```
 
 - 응답 시간 히스토그램: `t_done − t_act`, 깨움 지연: `t_start − t_act`(`t_start==0`이면 제외). 10 µs 빈 × 1024(=10.24 ms) + overflow.
-- `t_arr`/`marker`: 태스크의 SHM 슬롯이 `kind==EVT`이면 마커 사용 태스크로 보고 `flags |= JOB_FLAG_MARKER`(IF-V-001 `marker_used`)를 설정하고, 슬롯의 `t_arr_ns`(가장 최근 signal의 도달 시각)를 병합한다. 한 job이 여러 signal을 처리(코얼레싱)했는지는 SHM `job_seq` 증가량 − BPF `job_seq` 증가량으로 판별해 레코드에 남긴다.
+- Job 레코드에는 Event별 정보(`t_arr`, `event_seq`)를 병합하지 않는다. ringbuf 소비는 비동기이므로 레코드 처리 시점의 SHM 값은 이미 다음 Event의 것일 수 있다. Event↔Job 대응과 $t_{rel}$ 기준 응답 시간은 검증 프레임워크가 `job`·`src` 레코드와 생성기 로그를 `CLOCK_MONOTONIC` 기준으로 오프라인 대조해 산출한다(DDR-008 D-16).
+- `JOB_FLAG_MARKER`: 해당 태스크의 Event source가 marker-active이면 레코드에 설정한다(IF-V-001 `marker_used`).
 - `JOB_FLAG_TASK_EXIT` 레코드 → `on_task_exit` → `TaskRegistry::notify_exit`.
 - 출력 파일: `<node_id>.jobtrace.csv`(기본 비활성; `-t` CLI 또는 `SIGUSR1`로 토글).
+
+**(b) `EventSourceMonitor` — 어댑터 M의 Event source 통계**
+
+```cpp
+struct EventSourceSnapshot {            // model-level Event source statistics (IF-V-004)
+    uint64_t key;                       // wl_hash ^ task_hash
+    uint32_t event_seq;                 // arrivals notified (cumulative)
+    uint32_t consumed_seq;              // events handed to jobs (cumulative)
+    uint32_t pending;                   // event_seq − consumed_seq
+    uint32_t mit_violations;            // arrival-based, cumulative since bind
+    uint64_t last_arr_ns, t_sample_ns;
+};
+
+class EventSourceMonitor {
+public:
+    using OnMit          = std::function<void(uint64_t key, uint32_t delta, uint64_t last_arr_ns)>;   // → FaultMonitor (arrival-based MIT)
+    using OnSnapshot     = std::function<void(const EventSourceSnapshot&)>;                           // → JobTraceCollector
+    using OnMarkerActive = std::function<void(uint64_t key, bool active)>;                            // → FaultMonitor, JobTraceCollector
+    void set_shm(volatile struct timpani_ttsched_shm* shm, std::map<uint64_t,int> key_to_slot);       // at table apply; captures counter baselines
+    void clear_task(uint64_t key);
+    void poll();                        // called from the FaultMonitor poll thread every 100 ms (not an RT path)
+private:
+    struct Base { uint32_t event_seq; uint32_t mit_viol; bool marker_active; };
+    std::map<uint64_t, Base> base_;
+};
+```
+
+- `poll()`은 각 EVT 슬롯의 누적 카운터를 atomic load로 읽는다. `consumed_seq`를 먼저, `counter`(`event_seq`)를 나중에 읽어 `pending`이 음수가 되지 않게 한다. 카운터는 누적 값이므로 폴링 주기 사이의 변화는 유실되지 않는다(FR-N-026). 차이는 `uint32_t` 모듈로 연산으로 구한다.
+- `event_seq`가 기준값에서 처음 증가하면 그 source를 **marker-active**로 표시하고 `OnMarkerActive(key, true)`를 호출한다. 이후 그 source의 MIT 보고 원천은 도달 기준이다(§5.5).
+- `mit_viol_count` 증분이 있으면 `OnMit(key, delta, last_arr_ns)`. 트레이스가 비활성이어도 이 경로는 동작한다.
+- 테이블 재적용 시 같은 source의 기준값은 유지한다(슬롯 카운터는 TimerMaster가 보존, §5.6).
 
 ### 5.5 `fault_monitor.{h,cpp}` — 집계 확장
 
@@ -823,6 +881,10 @@ private:
 void set_task_params(Key key, uint32_t period_us, uint32_t current_limit);   // replaces update_current_limits for L2
 struct MitWindow { uint64_t window_start_ns; uint32_t count; };
 std::map<Key, MitWindow> mit_windows_;
+std::set<Key> marker_active_;                                 // sources whose MIT origin is arrival-based (adapter M)
+void set_marker_active(Key key, bool active);                 // from EventSourceMonitor
+void on_arrival_mit(Key key, uint32_t delta, uint64_t last_arr_ns);   // from EventSourceMonitor: add delta to the T_s window
+void poll_tick();                                             // existing 100 ms poll: ring_buffer__poll + event_sources.poll() + flush elapsed MIT windows
 std::map<Key, uint64_t> last_budget_episode_replenish_at_;   // dedupe BUDGET_EXCEED by replenish_at
 using FaultCallback = std::function<void(const FaultEvent&, uint32_t count, uint32_t dmiss_count)>;
 
@@ -842,22 +904,25 @@ static node::v1::FaultType to_proto_fault(uint8_t bpf_type) {
 switch (ev.fault_type) {
 case FAULT_DMISS:          dmiss_count++; if (dmiss_count > limit && !reported) callback(ev, 1, dmiss_count);  // unchanged rule + ev.flags passthrough
 case FAULT_BUDGET_EXCEED:  if (last_episode[key] != ev.expected_deadline_ns) { last_episode[key] = ...; callback(ev, 1, 0); }
-case FAULT_MIT_VIOLATION:  w = mit_windows_[key]; if (now - w.start ≥ period_ns) { if (w.count) flush(key); w = {now, 0}; } w.count++;
+case FAULT_MIT_VIOLATION:  if (marker_active_.count(key)) break;       // arrival-based origin is authoritative: never sum both (FR-N-014)
+                           w = mit_windows_[key]; if (now - w.start ≥ period_ns) { if (w.count) flush(key); w = {now, 0}; } w.count++;   // activation-based (adapter K)
                            // flush on window roll-over or on poll tick if window elapsed (≤ 1 report per T_s)
 }
 ```
+
+`on_arrival_mit()`는 같은 `MitWindow`에 `delta`를 더한다. 따라서 보고 형식(`FaultInfo{MIT_VIOLATION, count}`, source당 $T_s$ 윈도우에 1건)은 원천과 무관하게 같다. `DMISS` 보고 시 해당 source의 현재 윈도우에 MIT 위반이 있으면(원천 불문) `flags |= MIT_RELATED`를 보강한다(PRT-007).
 
 `NodeClient::send_fault(...)`는 `type = to_proto_fault(ev.fault_type)`, `task_id`(hash→name), `node_id`, `timestamp_ns`(REALTIME), `count`, `flags`, `job_seq`를 채운다(FR-N-015).
 
 ### 5.6 `timer_master.{h,cpp}` — SHM v2 및 L2 슬롯
 
 ```cpp
-struct EvtTaskEntry { std::string task_name; uint64_t task_id_hash; uint64_t workload_id_hash; };
+struct EvtTaskEntry { std::string task_name; uint64_t task_id_hash; uint64_t workload_id_hash; uint32_t mit_us; };
 void set_schedule_table(const std::vector<SlotEntry>& slots, const std::vector<EvtTaskEntry>& evt_tasks,
                         uint64_t hyperperiod_us, uint64_t epoch_ns);
 ```
 - `bool same_tt_table(slots, hp, epoch) const`: 현재 적용된 TT 슬롯 집합(cpu/offset/duration/task_hash)·hyperperiod·epoch와 동일하면 true. `void update_evt_slots(evt_tasks)`: per-CPU 스레드를 유지한 채 SHM만 재발행(아래 publish 순서; TT 슬롯 인덱스 보존). FR-N-006 / D-17(b).
-- 슬롯 할당 2-pass(기존 유지) 대상에 `evt_tasks`를 포함하고 `kind = TTSCHED_KIND_EVT`로 기록. EVT 슬롯의 `counter/t_arr_ns/job_seq`는 TimerMaster가 쓰지 않는다(publish 시 초기화만).
+- 슬롯 할당 2-pass(기존 유지) 대상에 `evt_tasks`를 포함하고 `kind = TTSCHED_KIND_EVT`로 기록한다. EVT 슬롯은 Event source 하나의 상태다. TimerMaster는 `mit_us`만 게시하고(`EvtTaskEntry.mit_us` 추가), `counter`(`event_seq`)·`consumed_seq`·`last_arr_ns`·`mit_viol_count`는 쓰지 않는다. 새 source의 슬롯은 0으로 초기화하고, 재발행에서 유지되는 source는 값을 보존하며, 슬롯 인덱스가 바뀌면 네 값을 새 위치로 복사한다(미결 Event 유실 방지). `shm()` 접근자를 `EventSourceMonitor`에 제공한다.
 - publish 순서: `magic=0` → 전 슬롯 wake → 슬롯 재배치 → `n_tasks`(release) → `generation++`(release) → `version=2`, `magic=MAGIC_V2`(release).
 - `cpu_thread_loop`: 지터 샘플을 `JobTraceCollector::add_tt_jitter_sample()`로 전달(락프리 SPSC 링, RT 안전). stdout 통계는 유지.
 
@@ -876,13 +941,18 @@ void set_schedule_table(const std::vector<SlotEntry>& slots, const std::vector<E
 | `ReplenisherTest.HeapOrder` / `RebuildOnTableChange` (kick 백엔드 mock) | FR-N-010 |
 | `FaultMonitorTest.BudgetExceedOncePerEpisode` / `MitWindowAggregation` / `DmissThresholdUnchanged` | FR-N-012~014 |
 | `JobTraceTest.HistogramPercentiles` / `MergesShmArrival` | FR-N-020~022 |
-| `ShmV2Test.EvtSlotsAllocatedStable` / `MagicVersionMismatchReturnsMinusOne` | IF-L-001/002 |
+| `ShmV2Test.EvtSlotsAllocatedStable` / `MagicVersionMismatchReturnsMinusOne` / `EvtCountersPreservedAcrossRepublish` | IF-L-001/002 |
+| `EvtApiTest.WaitReturnsBatchCount` (notify×3 중 대기 없음 → n=3) / `NoLostEventAcrossBusyJob` (처리 중 notify → 다음 wait 즉시 복귀, n=1) / `NoDuplicateAfterReinit` (`consumed_seq` 보존) | FR-L-001, MOD-007 (R2~R4) |
+| `EvtApiTest.NotifyCountsArrivalMitViolation` / `NotifyBeforeSourceRegisteredReturnsMinusOne` / `HandleSurvivesGenerationChange` | FR-L-002/007/008 |
+| `EventSourceMonitorTest.SnapshotPendingNeverNegative` / `MarkerActiveOnFirstArrival` / `MitDeltaNotLostBetweenPolls` | FR-N-026 |
+| `FaultMonitorTest.MarkerSourceUsesArrivalMitOnly` (BPF MIT 이벤트 무시, 합산 없음) / `DmissGetsMitRelatedFromArrivalWindow` | FR-N-014, PRT-007 |
 
 ---
 
-## 6. `libttsched` v2 (`sample-apps/src/libttsched.{h,c}`)
+## 6. `libttsched` v2 (`sample-apps/src/libttsched.{h,c}`) — 관측 어댑터 M
 
 > SRS OI-14 종결: 별도 라이브러리 없이 `libttsched`를 확장한다(DDR-008 D-03).
+> 이 절의 API는 공통 모델의 **Arrival**(notify)과 **wait point / R2~R4**(wait)를 구현한다. Activation/Start/Completion의 관측과 집행은 BPF(§4)가 하며, 라이브러리는 폴트를 판정하지 않는다.
 
 ### 6.1 헤더
 
@@ -890,105 +960,145 @@ void set_schedule_table(const std::vector<SlotEntry>& slots, const std::vector<E
 #define TIMPANI_TTSCHED_MAGIC   0x54494D51U   /* "TIMQ" — v2; v1 "TIMP" readers get -1 (ABI break by design) */
 #define TIMPANI_TTSCHED_VERSION 2U
 #define TIMPANI_MAX_TASKS       64
-#define TTSCHED_KIND_TT  0U
-#define TTSCHED_KIND_EVT 1U
+#define TTSCHED_KIND_TT  0U                   /* slot = TT activation point (notifier: TimerMaster) */
+#define TTSCHED_KIND_EVT 1U                   /* slot = L2 Event source (notifier: application adapter) */
 #define TTSCHED_EVT_BITSET 0x00455654U        /* "EVT": FUTEX_WAIT_BITSET mask marking an L2 wait point (P2 classifier); distinct from both magics */
+#define TTSCHED_EVT_MAX_SOURCES 16            /* per-process handle table (static, no heap) */
 
-struct timpani_task_slot {            /* 48 bytes */
-    char     name[16];
-    uint32_t counter;                 /* futex word: TT → TimerMaster; EVT → ttsched_evt_signal() */
+struct timpani_task_slot {            /* 64 bytes */
+    char     name[16];                /* task_id (comm) — P1 Event source id = consuming task */
+    uint32_t counter;                 /* futex word. TT: tick count (TimerMaster). EVT: event_seq = arrivals notified so far */
     uint32_t kind;                    /* TTSCHED_KIND_* */
-    uint64_t t_arr_ns;                /* EVT: last arrival timestamp written by signal() (CLOCK_MONOTONIC) */
-    uint32_t job_seq;                 /* EVT: incremented per signal() */
+    /* ---- EVT only: Event source state (all cumulative; read by timpani-n EventSourceMonitor) ---- */
+    uint32_t consumed_seq;            /* events already handed to jobs; written by the consuming task in ttsched_evt_wait() */
+    uint32_t mit_us;                  /* MIT published by timpani-n (0 = no arrival-based check) */
+    uint64_t last_arr_ns;             /* t_arr of the most recent event (CLOCK_MONOTONIC); written by notify */
+    uint32_t mit_viol_count;          /* arrival-based MIT violations; written by notify */
     uint32_t _pad;
-    uint64_t _reserved;
+    uint64_t _reserved[2];
 };
 
-struct timpani_ttsched_shm {          /* 32 + 64*48 = 3104 bytes */
+struct timpani_ttsched_shm {          /* 32 + 64*64 = 4128 bytes */
     uint32_t magic; uint32_t version; uint32_t n_tasks; uint32_t generation;
     uint64_t _reserved[2];
     struct timpani_task_slot tasks[TIMPANI_MAX_TASKS];
 };
 
-void ttsched_init(void);                         /* unchanged semantics; maps RDWR if permitted, else RDONLY (wait-only) */
+typedef int ttsched_evt_t;                       /* Event source handle (>= 0) */
+
+void ttsched_init(void);                         /* unchanged semantics; maps RDWR if permitted, else RDONLY (TT wait-only) */
 int  ttsched_wait_next_period(void);             /* L1, unchanged */
-int  ttsched_evt_wait(void);                     /* L2 wait point: FUTEX_WAIT_BITSET on own slot, mask TTSCHED_EVT_BITSET */
-int  ttsched_evt_signal(const char *task_name, uint64_t t_arr_ns);   /* wake task; t_arr_ns==0 → now; returns 0 / -1 (slot not found / shm not ready) */
+
+/* Event source handle for the L2 task `task_id`. Returns >= 0, or -1 if the handle table is full.
+ * Succeeds even if the source is not registered yet; it is resolved lazily and re-resolved on table updates. */
+ttsched_evt_t ttsched_evt_open(const char *task_id);
+
+/* Arrival: one event arrived at `src`. t_arr_ns == 0 → now. Wakes the consuming task if it is waiting.
+ * Returns 0, or -1 if the source is not registered / SHM not ready (the event is NOT counted). */
+int  ttsched_evt_notify(ttsched_evt_t src, uint64_t t_arr_ns);
+
+/* Wait point of the calling L2 task. Blocks until at least one event is pending, then returns
+ * n >= 1 = number of events this job must consume (events that arrived since the previous return).
+ * Returns at once if events are already pending. -1: shutdown/republish → call ttsched_init() and retry. */
+int  ttsched_evt_wait(void);
 ```
 
 ### 6.2 구현 요지
 
 ```c
-static __thread uint32_t g_evt_last_seen;   /* counter value consumed by the last returned wait */
-static __thread int      g_evt_primed;      /* 0 until the first wait (or after re-lookup): consume the current counter */
+struct evt_src { char name[16]; int idx; uint32_t generation; int used; };
+static struct evt_src g_src[TTSCHED_EVT_MAX_SOURCES];           /* process-wide; open() guarded by a spinlock, notify() lock-free */
 
-int ttsched_evt_wait(void) {
-    /* same shm/magic/generation/slot-lookup preamble as ttsched_wait_next_period(); on re-lookup set g_evt_primed = 0 */
-    volatile uint32_t *ctr = &g_shm->tasks[g_task_idx].counter;
-    if (!g_evt_primed) { g_evt_last_seen = __atomic_load_n(ctr, __ATOMIC_ACQUIRE); g_evt_primed = 1; }
-    /* lost-wakeup safe: a signal that arrived while the previous job was running already changed *ctr → return at once */
-    while (__atomic_load_n(ctr, __ATOMIC_ACQUIRE) == g_evt_last_seen) {
-        long r = syscall(SYS_futex, ctr, FUTEX_WAIT_BITSET, g_evt_last_seen, NULL, NULL, TTSCHED_EVT_BITSET);
-        if (r == -1 && errno != EAGAIN && errno != EINTR) break;
-        if (g_shm->magic != TIMPANI_TTSCHED_MAGIC) { /* shutdown/republish */ unmap; g_evt_primed = 0; return -1; }
+ttsched_evt_t ttsched_evt_open(const char *task_id) {
+    /* return the existing entry with the same name, else claim a free one: copy name, idx = -1 (unresolved) */
+}
+
+int ttsched_evt_notify(ttsched_evt_t src, uint64_t t_arr_ns) {
+    volatile struct timpani_ttsched_shm *shm = evt_shm_rw();            /* lazily mapped O_RDWR, cached per process */
+    if (!shm || shm->magic != TIMPANI_TTSCHED_MAGIC) return -1;
+    struct evt_src *s = &g_src[src];
+    uint32_t gen = __atomic_load_n(&shm->generation, __ATOMIC_ACQUIRE);
+    if (s->idx < 0 || s->generation != gen) {                           /* lazy (re-)resolve; closes L-4 */
+        s->idx = find_task_slot(shm, s->name); s->generation = gen;
+        if (s->idx < 0 || shm->tasks[s->idx].kind != TTSCHED_KIND_EVT) { s->idx = -1; return -1; }
     }
-    g_evt_last_seen = __atomic_load_n(ctr, __ATOMIC_ACQUIRE);   /* several signals during one job coalesce into one wakeup; the app drains its queue */
+    volatile struct timpani_task_slot *sl = &shm->tasks[s->idx];
+    if (t_arr_ns == 0) t_arr_ns = mono_now_ns();
+    uint64_t prev = __atomic_load_n(&sl->last_arr_ns, __ATOMIC_RELAXED);
+    uint32_t mit  = __atomic_load_n(&sl->mit_us, __ATOMIC_RELAXED);
+    if (prev && mit && t_arr_ns - prev < (uint64_t)mit * 1000ULL)       /* arrival-based MIT check (count only, no verdict) */
+        __atomic_fetch_add(&sl->mit_viol_count, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&sl->last_arr_ns, t_arr_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&sl->counter, 1, __ATOMIC_SEQ_CST);              /* Arrival: event_seq++ (never lost, even if the task is ACTIVE → R2) */
+    syscall(SYS_futex, &sl->counter, FUTEX_WAKE, 1, NULL, NULL, 0);     /* wakes the task only if it is WAITING → R1 */
     return 0;
 }
 
-int ttsched_evt_signal(const char *task_name, uint64_t t_arr_ns) {
-    volatile struct timpani_ttsched_shm *shm = signal_shm_rw();          /* lazily mapped O_RDWR, cached per process */
-    if (!shm || shm->magic != TIMPANI_TTSCHED_MAGIC) return -1;
-    int idx = find_task_slot(shm, task_name);                            /* small cache: name → idx, invalidated on generation change */
-    if (idx < 0 || shm->tasks[idx].kind != TTSCHED_KIND_EVT) return -1;
-    if (t_arr_ns == 0) t_arr_ns = mono_now_ns();
-    __atomic_store_n(&shm->tasks[idx].t_arr_ns, t_arr_ns, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&shm->tasks[idx].job_seq, 1, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&shm->tasks[idx].counter, 1, __ATOMIC_SEQ_CST);
-    syscall(SYS_futex, &shm->tasks[idx].counter, FUTEX_WAKE, 1, NULL, NULL, 0);   /* FUTEX_WAKE matches any bitset */
-    return 0;
+int ttsched_evt_wait(void) {
+    /* same shm/magic/generation/slot-lookup preamble as ttsched_wait_next_period() */
+    volatile struct timpani_task_slot *sl = &g_shm->tasks[g_task_idx];
+    uint32_t seen = __atomic_load_n(&sl->consumed_seq, __ATOMIC_ACQUIRE);   /* kept in SHM: survives re-init and table updates → no loss, no duplicate */
+    while (__atomic_load_n(&sl->counter, __ATOMIC_ACQUIRE) == seen) {       /* no pending event → sleep at the wait point (Completion seen by BPF) */
+        long r = syscall(SYS_futex, &sl->counter, FUTEX_WAIT_BITSET, seen, NULL, NULL, TTSCHED_EVT_BITSET);
+        if (g_shm->magic != TIMPANI_TTSCHED_MAGIC) { /* shutdown/republish */ unmap; return -1; }
+        if (r == -1 && errno != EAGAIN && errno != EINTR) return -1;
+    }
+    uint32_t cur = __atomic_load_n(&sl->counter, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&sl->consumed_seq, cur, __ATOMIC_RELEASE);             /* R4: this job consumes everything pending now */
+    return (int)(cur - seen);                                               /* n_events >= 1 (modulo-2^32 arithmetic) */
 }
 ```
 
-- `FUTEX_WAKE`(mask = MATCH_ANY)는 `FUTEX_WAIT_BITSET` 대기자를 깨우므로 TimerMaster의 종료·재발행 wake(`FUTEX_WAKE INT_MAX`)도 L2 대기자를 깨운다(FR-L-005).
-- SHM 권한: 현행 `0666` 유지. `signal()`은 쓰기 매핑이 필요하므로 어댑터 프로세스는 쓰기 권한이 있어야 한다(OI-15: P1은 동일 프로세스).
-- 비용: `signal()` = 3 atomic + 1 syscall(≈ 1–2 µs). `wait()`는 블로킹.
+- **R1~R4 대응**: 대기 중 notify → futex wake → 새 Job(R1). 처리 중 notify → `counter`만 증가, wakeup 없음(R2). 다음 wait에서 `counter != consumed_seq` → 수면 없이 복귀(R3). 반환값이 그 Job의 `n_events`(R4).
+- **유실·중복 없음**: `counter`는 atomic 누적, `consumed_seq`는 소비 태스크만 쓴다. 종료·재발행 wake(`FUTEX_WAKE INT_MAX`, 카운터 불변)는 `magic` 검사로 −1 복귀한다(FR-L-005). `FUTEX_WAKE`는 `FUTEX_WAIT_BITSET` 대기자를 깨운다.
+- **동시성**: 같은 source에 대한 notify가 여러 스레드에서 동시에 호출되어도 Event는 유실되지 않는다. 다만 `last_arr_ns` 비교가 경합하면 `mit_viol_count`가 ±1 어긋날 수 있으므로, 계수 정확성이 필요하면 source당 notifier를 직렬화한다(HLD-008 §8.1 3항).
+- **쓰기 매핑**: `ttsched_evt_wait`(`consumed_seq`)와 `ttsched_evt_notify`는 쓰기 매핑이 필요하다. SHM 권한은 현행 `0666` 유지(OI-15: P1은 동일 프로세스 또는 쓰기 권한이 있는 동일 호스트 프로세스). 읽기 전용으로만 매핑된 경우 `ttsched_evt_wait`는 스레드 로컬 `seen`으로 동작한다(재초기화 시 미결 Event 보존 없음).
+- **비용**: notify = atomic 5회 + 시스템 콜 1회(≈ 1–2 µs). wait는 미결 Event가 있으면 atomic 3회, 없으면 블로킹.
+- **P2 확장**: 태스크당 다중 source는 `ttsched_evt_open`의 source 지정 변형과 source별 슬롯으로 수용하며 notify/wait 시그니처는 그대로다.
 
 ---
 
 ## 7. 샘플 앱
 
-### 7.1 `sample-apps/src/evttask.c` (신규, 전송 계층 중립 L2 생성기)
+### 7.1 `sample-apps/src/evttask.c` (신규, 범용 이벤트 생성기 — 수용 기준의 기준 검증 수단)
 
 ```text
 evttask --name cbs_task --source {timerfd|udp:<port>|pipe|self} --mit-us 18000 --wcet-us 1500
-        [--burst N] [--overrun-us U] [--midjob-block-us B] [--marker on|off] [--count K]
+        [--burst N] [--overrun-us U] [--midjob-block-us B] [--marker on|off] [--count K] [--log FILE]
 
 threads:
   worker (comm = --name): ttsched_init();
-     loop: wait = (--marker on) ? ttsched_evt_wait() : source_blocking_wait();     // epoll_wait/read
-           run_nsqrt_for(wcet_us ± overrun); if (midjob_block_us) nanosleep(midjob_block_us) [reproduces A-06 violation];
-  source  (not an L2 task): generates events at MIT (or MIT/3 for --burst N) → write(udp/pipe) or timerfd or
-           ttsched_evt_signal(name, now) (for --source self with --marker on; for other sources with --marker on, the
-           source thread calls signal() right after the write so t_arr is recorded)
+     loop: n = (--marker on) ? ttsched_evt_wait() : source_blocking_wait();     // adapter M : adapter K only (epoll_wait/read, n = 1)
+           for i in 1..n: run_nsqrt_for(wcet_us ± overrun);                     // consume exactly n events (R4)
+           if (midjob_block_us) nanosleep(midjob_block_us);                     // reproduces the A-06 violation
+  source (not an L2 task): src = ttsched_evt_open(--name);
+     generates events at MIT (or MIT/3 for --burst N):
+       --marker on : enqueue item; ttsched_evt_notify(src, now)   (for udp/pipe/timerfd the item still travels through that
+                     channel into the app queue first, so the same binary exercises four delivery means with one TIMPANI config)
+       --marker off: write(udp/pipe) or timerfd expiry is itself the wakeup
+     logs (event_seq, t_arr) per event to --log for offline correlation with the job/src trace records
 ```
 `cbstask.c`는 유지하되 README에서 `evttask`를 권장 생성기로 표기한다.
 
 ### 7.2 FCW 어댑터 축소 (`examples/someip/radar_based_fcw/fcw_consumer.cpp`)
 
 ```cpp
-// vsomeip handler (any middleware thread) — the only TIMPANI touch point
+static ttsched_evt_t g_src;                               // Event source handle of the L2 task "cbs_task"
+// init (any thread, once): g_src = ttsched_evt_open("cbs_task");
+
+// vsomeip handler (any middleware thread) — the only TIMPANI touch point on the receive side
 void on_obstacle_alert_received(const std::shared_ptr<vsomeip::message>& m) {
     uint64_t t_arr = mono_now_ns();
-    alerts.push({parse(m), t_arr});                       // app queue (lock-free or mutex outside worker's job)
-    ttsched_evt_signal("cbs_task", t_arr);                // D-03 marker; no service/instance/event IDs
+    alerts.push({parse(m), t_arr});                       // enqueue first (lock-free or mutex outside the worker's job)
+    ttsched_evt_notify(g_src, t_arr);                     // Arrival; no service/instance/event IDs
 }
 // worker
 void* cbs_worker(void*) {
     pthread_setname_np(pthread_self(), "cbs_task"); ttsched_init();
     for (;;) {
-        if (ttsched_evt_wait() < 0) continue;             // wait point (P1 rule a)
-        while (auto a = alerts.try_pop()) process(*a);    // one job may drain several alerts; a signal during the drain bumps the counter, so the next evt_wait() returns at once (no lost wakeup)
+        int n = ttsched_evt_wait();                       // wait point; n = events this job consumes
+        if (n < 0) { ttsched_init(); continue; }
+        for (int i = 0; i < n; ++i) process(alerts.pop()); // exactly n (normally 1); never "drain until empty"
     }
 }
 ```
@@ -1006,7 +1116,7 @@ void* cbs_worker(void*) {
 | 예산 초과 | 슬라이스 만료 = 틱 경계(HZ=1000: ≤1 ms) + `stopping` 차감 | ≤ 1 ms (P1) | TMG-004 |
 | DMISS 감지 | `quiescent` 즉시(완료) 또는 다음 `stopping`(조기, ≤ 슬라이스 ≤ $C_s$) | ≤ 마감 + $C_s$ | TMG-005 |
 | DMISS 보고 | ringbuf → FaultMonitor 폴링(≤100 ms) → gRPC Write | ≤ +200 ms | TMG-006 |
-| 감지 오버헤드 | `runnable`(≈300 ns) + `quiescent`(≈400 ns + ringbuf 제출 ≈300 ns) + `signal()` 1 syscall(≈1 µs) | ≤ 2 µs/이벤트 | TMG-011 |
+| 감지 오버헤드 | `runnable`(≈300 ns) + `quiescent`(≈400 ns + ringbuf 제출 ≈300 ns) + `notify()` atomic 5회 + 1 syscall(≈1 µs) | ≤ 2 µs/이벤트 | TMG-011 |
 
 L1 영향(TMG-008): L2 변경 중 TT 경로에 추가된 코드는 `select_cpu`의 분기 1개와 `dispatch`의 `cpu_is_isolated` 검사뿐이다.
 
@@ -1023,6 +1133,8 @@ L1 영향(TMG-008): L2 변경 중 TT 경로에 추가된 코드는 `select_cpu`�
 | SHM v1 소비자(구 libttsched) | `magic` 불일치로 `-1` 반복 반환 → 앱 로그로 식별 가능 |
 | MIT=0 (전환 규칙도 불가) | O에서 `ParamInvalid` 거부 |
 | 태스크 종료 | `exit_task` 레코드 또는 재스캔 → 상태 정리, 미해결로 복귀 |
+| source 등록 전 또는 SHM 재발행 창(`magic=0`) 중 `ttsched_evt_notify` | −1 반환, Event는 계수되지 않음. 앱은 항목을 큐에서 되돌리거나 폐기를 선택. 등록 후에는 핸들 재획득 없이 동작 |
+| 처리 중 Event 도달 | 미결로 누적(R2), 다음 wait가 즉시 복귀(R3). `src` 레코드의 `pending`과 `n_events > 1`로 관측. 유실 없음 |
 | 동일 이름 다중 매칭 | 첫 매칭 사용(현행) + WARN. 유일성은 앱 계약(HLD §8.1) |
 
 ---
@@ -1031,18 +1143,18 @@ L1 영향(TMG-008): L2 변경 중 TT 경로에 추가된 코드는 `select_cpu`�
 
 | AC-008 | 수단 | 훅 |
 |:--|:--|:--|
-| 01 | `evttask --marker on/off` ×100,000 이벤트; `fcw_consumer` | `jobtrace.csv` job 레코드 vs 생성기 로그(`job_seq`) |
+| 01 | `evttask --marker on/off` ×100,000 이벤트 | `jobtrace.csv`의 `src` 레코드(`event_seq`, `consumed_seq`) + `job` 레코드 vs 생성기 로그(`event_seq`, `t_arr`): 도달 계수 누락·중복 0, Σ n = 도달 수, MIT 준수 구간 Job 수 = 도달 수 |
 | 02 | TT 테이블 고정 + `evttask --burst` A/B 1 h | `jobtrace.csv` tt 레코드 지터 p99.99 |
 | 03 | `evttask --overrun-us`; `fcw_consumer -be` | `cbs_map` 샘플링(bpftool), `BUDGET_EXCEED` 수, Replenisher 로그 vs `remaining_us` 복원 시각 |
 | 04 | `fcw_consumer --overrun-ms 10` | FaultMonitor 로그 타임스탬프, O 수신 로그 |
 | 05 | `evttask --source udp` 외부 생성기(타 노드/CPU) | job 레코드 `t_start−t_act` |
 | 06 | 1 h 정격 + 폭주 | `perf sched`/`sched_switch` 트레이스에서 cbs_task CPU 집합 |
-| 07 | `mock_radar_producer --burst-ms 6` (≈ MIT/3) | `MIT_VIOLATION count`, DMISS `flags & 0x1` |
+| 07 | `evttask --burst N --marker on` (MIT/3); FCW 재현: `mock_radar_producer --burst-ms 6` | `MIT_VIOLATION count` = 생성기 위반 수(도달 기준), `src` 레코드 `pending`/Σ n = 도달 수, DMISS `flags & 0x1` |
 | 08 | GTest `FifoAdmission_*`, `RejectRestoresPreviousWorkload` | — |
 | 09 | `mock_pullpiri.py` add/remove 10회 | 데몬 PID 불변, `bpftool map dump` 잔존 0 |
 | 10 | `evttask`를 테이블 적용 후 기동 | `Registered CBS task` 로그 시각 − 기동 시각 |
 | 11 | `mock_pullpiri.py` 수신 로그 | 유형/카운트 |
-| 12 | `grep -rniE 'someip|vsomeip|service_id|instance_id' timpani-o timpani-n sample-apps` = 0 | — |
+| 12 | `grep -rniE 'someip|vsomeip|service_id|instance_id' timpani-o timpani-n sample-apps` = 0; `evttask --source timerfd/udp/pipe/self`를 TIMPANI 설정 변경 없이 전환하여 01~07 재확인 | — |
 
 ---
 
@@ -1059,7 +1171,7 @@ L1 영향(TMG-008): L2 변경 중 TT 경로에 추가된 코드는 `select_cpu`�
 | N-2 | `libttsched` v2 + TimerMaster SHM v2 + L2 슬롯 | `sample-apps/src/libttsched.{h,c}`, `timer_master.{h,cpp}` | — |
 | N-3 | TaskRegistry 재설계, main.cpp 레이어 분기·바인딩·정리 | `task_registry.{h,cpp}`, `main.cpp`, `bpf_loader.{h,cpp}` | N-1, N-2, O-1 |
 | N-4 | Replenisher + kick 백엔드(PoC 포함) | `replenisher.{h,cpp}`(신규), `bpf_loader.*` | N-1 |
-| N-5 | JobTraceCollector, FaultMonitor 집계, NodeClient 필드 | `job_trace.{h,cpp}`(신규), `fault_monitor.*`, `grpc/node_client.*` | N-1, O-1 |
+| N-5 | JobTraceCollector, EventSourceMonitor, FaultMonitor 집계, NodeClient 필드 | `job_trace.{h,cpp}`(신규), `event_source_monitor.{h,cpp}`(신규), `fault_monitor.*`, `grpc/node_client.*` | N-1, N-2, O-1 |
 | N-6 | timpani-n GTest 타깃 신설(§5.8) | `timpani-n/tests/*`, `CMakeLists.txt` | N-1~5 |
 | S-1 | `evttask.c`, FCW 어댑터 축소, `libtimpani_rt` 폐기, yaml/json MIT | `sample-apps/src/evttask.c`, `examples/someip/*`, `scripts/*` | N-2, O-1 |
 | D-1 | 문서 정합: DDR-002 §7, DDR-005, DDR-007 §4.2/§4.5.3/§7, DDR-012, `structure.md`, README/CHANGELOG | `doc/**` | 전체 |
@@ -1076,6 +1188,7 @@ L1 영향(TMG-008): L2 변경 중 TT 경로에 추가된 코드는 `select_cpu`�
 | L-1 | `scx_bpf_kick_cpu`의 SYSCALL 프로그램 호출 가능성(OI-9) — 커널 6.12.x 빌드에서 PoC | §5.3 백엔드 선택 |
 | L-2 | `ops.runnable`이 `sched_setattr(SCHED_EXT)` 전환 시점에 호출되는지(첫 job 측정 왜곡) — 첫 job에 `JOB_FLAG_FIRST` 추가 여부 | 통계 정확도 |
 | L-3 | `trace_enabled`를 `.bss` 변수로 둘지 1-엔트리 ARRAY 맵으로 둘지(libbpf 스켈레톤 접근 편의) | 구현 편의 |
-| L-4 | `ttsched_evt_signal`의 name→idx 캐시 무효화 규칙(generation 변경 감지) | 어댑터 지연 |
+| L-4 | name→idx 캐시 무효화 규칙 — **종결**: Event source 핸들(`ttsched_evt_open`)이 generation 변경 시 notify에서 재해결(§6.2) | — |
 | L-5 | `JobTraceCollector` CSV와 기존 `gpdata` 포맷 통합 여부 — HLD-008 H-2와 동일 이슈, H-2로 통합 | 도구 체인 |
+| L-7 | back-to-back Job(R3) 경계의 커널 관측(REQ-008 OI-17). 후보: 수면 없는 wait 복귀 시 `sched_yield()` → BPF `ops.yield`에서 Completion/Activation 기록 | 병합 구간의 응답 시간 정밀도 |
 | L-6 | Rust proto(`timpani_rust/timpani-o/proto/schedinfo.proto`)에 필드만 동기화할지, Rust 포트 작업 시 일괄 반영할지 | Rust CI |
