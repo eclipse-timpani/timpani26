@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 # REQ-008: Event-Driven Workload Support 요구사항 정의서
 
 **날짜:** 2026-10-25 (Last Updated: 2026-11-10)
-**상태:** Draft (v3 — 공통 Event/Job 모델과 3층 구조 도입)
+**상태:** Draft (v4 — 독립 검토 반영: 모델 규칙 정리, 어댑터 적합 조건, 보충 규칙)
 **작성:** Human + AI
 **관련 문서:** [SRS-000](SRS-000-timpani-system.md), [DDR-001](DDR-001-workload-model.md), [DDR-002](DDR-002-scheduling-architecture.md), [DDR-003](DDR-003-interface-protocol.md), [DDR-004](DDR-004-resource-allocation.md), [DDR-005](DDR-005-sched-ext-bpf-scheduler.md), [DDR-007](DDR-007-tt-cbs-integrated-scheduling.md), [DDR-011](DDR-011-runtime-table-update.md), [DDR-012](DDR-012-fault-management.md)
 **하위 문서:** SRS-008 (소프트웨어 요구사항), DDR-008 (설계 결정), HLD-008 (상위 설계), LLD-008 (상세 설계)
@@ -20,7 +20,7 @@ SPDX-License-Identifier: MIT
 - **단계**: Phase 1은 기본 기능(Event 감지, CBS 실행, 최소 폴트 처리, 기본 관측)과 FCW 샘플 앱 완성에 집중하고, Phase 2는 정밀 승인식·EDF·시스템 콜 분류·증분 테이블 갱신 등 고급 기능을 다룬다. 각 요구사항에 P1/P1*/P2를 표기했다.
 - **코드베이스 갭**: §10에 현행 `timpani26`(HEAD `4201573`) 대비 17개 갭을 파일 근거와 함께 정리했으며, §12에 PR #50~52 샘플 앱에 대한 가이드(마커 API 전환, SOME/IP 결합 제거)를 포함한다.
 - **구조**: 모델(①) / 관측 어댑터(②: 커널 관측, 애플리케이션 마커, P2 미들웨어 경계) / 집행(③: CBS·폴트·통계)의 3층으로 나눈다. 집행은 항상 커널 관측 사건을 쓰고, 마커는 도달 정보(Event 계수, 도달 기준 MIT, $t_{arr}$)를 더한다.
-- **상태**: Draft v3. TIM 후보값은 RPi5 측정 후 확정(OI-5). 하위 문서 SRS/DDR/HLD/LLD-008이 본 문서를 기준으로 작성되었다.
+- **상태**: Draft v4. TIM 후보값은 RPi5 측정 후 확정(OI-5). 하위 문서 SRS/DDR/HLD/LLD-008이 본 문서를 기준으로 작성되었다.
 
 ---
 
@@ -29,7 +29,7 @@ SPDX-License-Identifier: MIT
 >
 > **세 가지 설계 원칙**
 > 0. **공통 모델 우선(Model-First)**: Event와 Job을 OS·스케줄러·미들웨어와 무관한 **공통 모델**(§2)로 먼저 정의하고, TIMPANI는 그 모델에 대응하도록 설계·구현한다. 구현 수단(커널 wakeup, futex, sched_ext 콜백, 라이브러리)은 모델의 사건을 관측·집행하는 수단일 뿐 모델을 정의하지 않는다.
-> 1. **전송 계층 중립(Transport-Neutral)**: TIMPANI 코어(TIMPANI-O/N, BPF, 애플리케이션 라이브러리 계약)는 SOME/IP, DDS, CAN 등 **특정 미들웨어·전송 계층의 식별자나 의미론을 포함하지 않는다.** TIMPANI가 아는 것은 공통 모델의 Event source와 그 도달(Arrival)뿐이며, 미들웨어 고유 처리(서비스/인스턴스/이벤트 ID, 구독, 역직렬화)는 애플리케이션 또는 애플리케이션 측 어댑터의 책임이다. 과거 검토 초안이 SOME/IP를 코어 계약에 직접 언급한 점을 본 개정에서 바로잡는다.
+> 1. **전송 계층 중립(Transport-Neutral)**: TIMPANI 코어(TIMPANI-O/N, BPF, 애플리케이션 라이브러리 계약)는 SOME/IP, DDS, CAN 등 **특정 미들웨어·전송 계층의 식별자나 의미론을 포함하지 않는다.** TIMPANI가 아는 것은 공통 모델의 Event source와, 사용 중인 관측 어댑터가 관측한 생명주기 사건뿐이며(도달 Arrival은 마커 어댑터에서만 직접 관측된다), 미들웨어 고유 처리(서비스/인스턴스/이벤트 ID, 구독, 역직렬화)는 애플리케이션 또는 애플리케이션 측 어댑터의 책임이다. 과거 검토 초안이 SOME/IP를 코어 계약에 직접 언급한 점을 본 개정에서 바로잡는다.
 > 2. **단계적 접근(Phased)**: **Phase 1**은 현실적이고 단순한 기본 기능(Event 정의·감지, CBS 격리 실행, 최소 폴트 처리, 기본 관측)에 집중하여 `timpani26` 구현과 FCW 샘플 앱 완성을 함께 이끈다. **Phase 2**는 Phase 1 검증 후 고급 기능(정밀 job 경계 분류, EDF 순서, 윈도우 기반 승인, 증분 갱신, 미들웨어 경계 관측, watchdog 등)을 다룬다. 요구사항 ID는 Phase와 무관하게 안정적으로 유지하며, Phase 열로 범위를 표시한다.
 >
 > **키워드 규약**: **SHALL** = 필수, **SHOULD** = 권장, **MAY** = 선택.
@@ -44,6 +44,7 @@ SPDX-License-Identifier: MIT
 | v1 | 2026-10-25 | Baseline 초안. MOD/DET/CBS/PRT 9개 요구사항, UC-01/02, AC-01~04 |
 | v2 | 2026-11-09 | (a) 전송 계층 중립 원칙과 Phase 1/2 분할 원칙 명시. (b) `timpani26` HEAD `4201573` 코드베이스 갭 분석(§1.3, §10) 반영. (c) 신규 요구사항 그룹 ORD/IF/TIM/RTU/OBS/NFR 추가, 기존 ID 유지. (d) 정량 타이밍 요구사항(TIM)과 측정 방법 도입. (e) 수용 기준에 수치·측정법 추가. (f) 범위 외·가정·오픈 이슈 명시. (g) UC-03~06 추가. (h) 선행 샘플 앱(PR #50~#52)과의 관계 및 가이드 방향(§12) |
 | v3 | 2026-11-10 | (a) §2를 **공통 Event/Job 모델**로 재작성: Event source·Event·Job 엔티티, 생명주기 사건 4종, 규칙 R1~R4, 불변식 I1, 3층 구조(모델/관측 어댑터/집행). (b) Event(도달)와 Job(처리)을 분리: MIT는 도달 기준, 한 Job은 1개 이상의 Event 소비. MOD-007/008 추가, MOD-001/002/006·DET-004·PRT-004·OBS-001/002·IF-005 개정. (c) UC/AC에서 샘플 앱 고유 수치·옵션을 제거하고 범용 이벤트 생성기 기준으로 기술. (d) 마커 인터페이스를 `open/notify/wait` 형태로 정리(§12.2) |
+| v4 | 2026-11-10 | 독립 검토(7개 관점 + 반박 검증) 반영. (a) R2/R4를 "미소비 Event" 기준으로 재정의(자신을 깨운 Event 포함), 동시 발생 경계 규칙 추가. (b) 어댑터 적합 조건 명시: P1에서 Job 경계는 마커 사용 여부와 무관하게 커널 관측을 따르며 A-06이 모든 L2 태스크의 전제(MOD-003, DET-002/005, A-06). (c) **보충 규칙 변경**: 격자 정렬 보충은 MIT를 지키는 태스크도 스로틀시킬 수 있어 활성화 기준 보충 윈도우로 교체(PRT-001, OI-4). 스로틀된 서버는 보충 후 큐 뒤로(ORD-002). (d) 승인식이 CPU의 모든 L2 태스크에 대해 성립해야 함을 명시(CBS-004, AC-008-08). (e) MIT 위반 계수의 정확성 요구를 마커 어댑터로 한정(PRT-004), DMISS 표식 규칙 정의(PRT-007 SHALL). (f) TIM-005 감지 기준을 완료 시점으로 정정, TIM 백분위 보완. (g) `task_id` 15바이트·노드 내 유일 제약(A-03). (h) AC-008-01/04/08/12 정정. (i) 수정안 검증 반영: 위반이 있었던 서버의 보장 범위 명시(PRT-001), 예산 이월 표식(PRT-007), `libttsched` 재빌드 예외(NFR-003), $t_{rel}$ 기준 응답 시간의 정의 구간(§2.3), TIM 통계 기준(§4.6) (j) §12.2에 가이드의 두 층을 명시: 임의의 Event 종류를 공통 모델에 올리는 적용 방법론(HLD-008 §8.1~8.3)과 FCW 예제의 파일별 수정 가이드(HLD-008 §8.4, LLD-008 §7.2). |
 
 ### 0.1 Phase 정의
 
@@ -65,7 +66,7 @@ TIMPANI 구현과 무관하게, 안전 중요 Event-Driven 워크로드를 실�
 | # | 특성 | 설명 | Phase |
 |:--|:--|:--|:-:|
 | G1 | **Sporadic 태스크 모델** | MIT(최소 도달 간격), WCET, 상대 마감(D)을 선언. D는 **이벤트 도달 시점** 기준이어야 함(디스패치 시점 기준이 아님) | P1 |
-| G2 | **도달(arrival) 관측** | 이벤트가 "언제 도달했는가"를 전송 계층과 무관하게 타임스탬프. 관측점이 늦을수록 응답 시간 측정이 낙관적으로 왜곡됨 | P1(커널 wakeup) / P2(미들웨어 경계) |
+| G2 | **도달(arrival) 관측** | 이벤트가 "언제 도달했는가"를 전송 계층과 무관하게 타임스탬프. 관측점이 늦을수록 응답 시간 측정이 낙관적으로 왜곡됨 | P1(마커 어댑터가 도달을 관측, 커널 관측은 활성화로 근사) / P2(미들웨어 경계) |
 | G3 | **Job 경계 정의** | 1회 이벤트 처리의 시작/끝이 명확해야 응답 시간·마감 판정이 성립. 처리 도중의 내부 블로킹(뮤텍스/I/O)을 새 job으로 오인하면 안 됨 | P1(마커 기반) / P2(마커 없는 정밀 분류) |
 | G4 | **대역폭 격리** | 예산(C_s)/주기(T_s) 서버로 CPU 사용량을 상한. 이벤트 폭주(MIT 위반)·실행 시간 초과가 타 워크로드에 전파되지 않아야 함(FFI) | P1 |
 | G5 | **승인 제어** | 이용률 검사만으로는 D < MIT인 경우의 마감 보장이 불충분. 상위 계층(L1 TT 슬롯)에 의한 최대 블로킹과 동일 CPU 내 타 서버 간섭을 반영한 응답 시간 바운드 필요 | P1(단순 블로킹 합) / P2(윈도우 수요) |
@@ -82,7 +83,7 @@ TIMPANI 구현과 무관하게, 안전 중요 Event-Driven 워크로드를 실�
 기존 설계([DDR-001](DDR-001-workload-model.md), [DDR-005](DDR-005-sched-ext-bpf-scheduler.md), [DDR-007](DDR-007-tt-cbs-integrated-scheduling.md))와 `timpani26` 코드베이스는 L2 워크로드에 CBS 예산을 할당·차감하는 메커니즘을 **이미 end-to-end로 갖추고 있다**(TemporalClass → Mechanism::CBS → `CbsConfig` → BPF `cbs_map` → 예산 차감/스로틀링). 그러나 **Event-Driven 워크로드의 근본 동작 모델**에 대해 다음이 정의되지 않았거나 구현이 결정론 요구를 만족하지 못한다(근거: §10 갭 요약표).
 
 1. **Event의 정의 부재**: TIMPANI 관점에서 무엇을 "Event 발생"과 "Event 처리 작업(Job)"의 시작·끝으로 볼지 기준이 모호하다. 현 BPF는 **모든** wakeup에서 `activation_ns`를 덮어쓰므로(`timpani.bpf.c:256`), job 도중의 뮤텍스/I/O 블로킹 후 재깨움이 새 활성화로 오인되어 마감 판정과 도달 카운트가 오염된다.
-2. **Event 감지·활성화 시점의 불명확성**: 활성화 시각(`activation_ns`)과 마감(`deadline_us`)의 기준점이 "커널 wakeup"인지 "미들웨어가 관측한 도달"인지 정해지지 않았다. 또한 L2 마감 판정이 job 완료 시점이 아니라 **매 stopping마다** 수행된다.
+2. **Event 감지·활성화 시점의 불일치**: 마감의 기준은 Event 도달(§2.3의 $t_{rel}$)이어야 하지만 현 코드는 커널 wakeup 시각만 기록하며, 둘의 관계(A-04의 근사)가 정의되어 있지 않았다. 또한 L2 마감 판정이 job 완료 시점이 아니라 **매 stopping마다** 수행된다.
 3. **Event 감지와 CBS 런타임의 연결**: 활성화된 태스크가 L1(TT)과 간섭 없이 CBS 예산 내에서 실행되고 완료 후 재대기하는 종단간 흐름은 존재하나, (a) 보충이 BPF ops 경로 진입에만 의존해 **보충 지연 상한이 없고**, (b) `DSQ_CBS`가 전역 큐라서 L2 태스크가 **배정 CPU 밖에서 실행**될 수 있어 CPU별 Gap 분석(DDR-007)이 무효화되며, (c) 승인 검사가 이용률만 보고 **TT 블로킹·D<MIT·동일 CPU 서버 간섭**을 반영하지 않는다.
 4. **정량 바운드 부재**: 깨움 지연, 보충 지연, 예산 초과 허용치, 감지·보고 지연에 대한 수치 요구사항이 없어 검증 프레임워크가 합부를 판정할 수 없다.
 5. **인터페이스 불일치**: Pullpiri→O proto에 MIT 전용 필드가 없고 `period`를 재사용한다. O→N에는 `ExecutionModel.EVENT_DRIVEN`이 선언만 되어 있고 항상 `TIME_TRIGGERED`로 발행된다. BUDGET_EXCEED/WATCHDOG 폴트는 O→Pullpiri 경계에서 UNKNOWN으로 소실된다.
@@ -131,9 +132,10 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 **규칙**
 
 - **R1 (대기 중 도달)**: 태스크가 `WAITING`일 때 Arrival이 발생하면 새 Job이 활성화된다.
-- **R2 (처리 중 도달)**: 태스크가 `ACTIVE`일 때 발생한 Arrival은 **미결(pending)** Event가 된다. 새 Job을 만들지 않으며, 유실되지도 않는다.
-- **R3 (연속 Job)**: Completion 시점에 미결 Event가 있으면 다음 Job이 즉시 활성화된다(back-to-back).
-- **R4 (소비)**: Job은 자신의 활성화 시점에 미결이던 Event를 모두 소비한다(`n_events ≥ 1`). 그 이후 도달한 Event는 다음 Job의 몫이다.
+- **R2 (처리 중 도달)**: 태스크가 `ACTIVE`일 때 발생한 Arrival은 새 Job을 만들지 않고 **미소비(pending) Event**로 남는다. 유실되지 않는다.
+- **R3 (연속 Job)**: Completion 시점에 미소비 Event가 있으면 다음 Job이 즉시 활성화된다(back-to-back).
+- **R4 (소비)**: Job은 처리를 시작하는 시점(wait point를 떠나는 시점)까지 도달했고 아직 소비되지 않은 Event를 **모두** 소비한다. R1로 활성화된 Job은 자신을 깨운 Event를 포함하므로 항상 `n_events ≥ 1`이다. 그 이후 도달한 Event는 다음 Job의 몫이다.
+- **경계 규칙**: Arrival과 Completion이 같은 시각이면 Completion이 먼저 일어난 것으로 본다(R1 적용).
 
 **불변식 I1**: 모든 도달이 MIT를 지키고 모든 Job이 $R \le D \le \text{MIT}$를 지키는 **정상 조건**에서는 R2/R3이 발생하지 않으며 **Job과 Event는 1:1**이다(`n_events = 1`). 따라서 `n_events > 1` 또는 back-to-back Job의 발생은 그 자체로 "MIT 위반 또는 선행 Job의 마감 초과"를 뜻하는 관측 지표다.
 
@@ -141,18 +143,19 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 
 - MIT 제약: 같은 source의 연속된 두 Arrival에 대해 $t_{arr}(e_{n+1}) - t_{arr}(e_n) \ge \text{MIT}$. 위반은 **MIT 위반**(모델 위반, 입력 측 문제)이다.
 - 마감 제약: Job j의 해제(release) 시각 $t_{rel}(j)$는 j가 소비하는 첫 Event의 $t_{arr}$이며, $R(j) = t_{done}(j) - t_{rel}(j) \le D$. 위반은 **마감 실패**(DMISS)다.
-- R1로 활성화된 Job에서는 $t_{rel} \approx t_{act}$(차이는 관측 지연). P1의 판정은 $t_{act}$를 $t_{rel}$의 근사로 사용한다(A-04).
+- R1로 활성화된 Job에서는 $t_{rel} \approx t_{act}$(차이는 도달에서 활성화까지의 지연). P1의 판정은 $t_{act}$를 $t_{rel}$의 근사로 사용한다(A-04). 따라서 P1 판정값 $R_{act} = t_{done} − t_{act}$는 $t_{act} − t_{rel}$만큼 **낙관적**이다. 이 차이와 Event↔Job 대응은 P1에서 오프라인 대조로 구하며, §2.4의 P1 적합 조건(MIT 준수, $R \le D$, mid-job blocking 없음)이 성립하는 구간에 대해서만 정의한다: 그 구간에서는 I1에 의해 k번째 Job이 k번째 도달을 소비하므로 $t_{rel}(k)$ = k번째 $t_{arr}$이다.
 
 ### 2.4 관측 어댑터
 
 | 어댑터 | Arrival | Activation / Start | Completion | 알려진 한계 | Phase |
 |:--|:--|:--|:--|:--|:-:|
-| **K. 커널 관측** (기본, 앱 변경 없음) | 직접 관측 불가. Activation으로 근사하며 `event_seq`·`n_events`는 없다 | `WAITING` 태스크의 wakeup / 첫 실행 | 자발적 수면 진입 | (a) mid-job blocking이 Job을 분할한다(A-06). (b) 처리 중 도달(R2)이 보이지 않는다. (c) back-to-back Job(R3)은 수면이 없어 하나의 구간으로 병합된다 — 병합 구간은 실제 응답 시간보다 길게 측정되므로 판정은 **보수적**이다 | P1 |
-| **M. 애플리케이션 마커** (선택, 전송 계층 중립) | 앱(또는 앱 측 어댑터)이 도달을 통지: `event_seq` 증가, $t_{arr}$ 기록, **도달 기준 MIT 검사** | K와 동일(커널이 관측). wait point 복귀 시 `n_events`를 앱에 전달(R4) | 명시적 wait point 진입. 수면이 따르면 K가 관측 | 도달 정보는 앱이 제공하므로 앱을 신뢰한다(집행은 영향받지 않음). back-to-back 병합은 P1에서 K와 같다 | P1 |
+| **K. 커널 관측** (기본, 앱 변경 없음) | 직접 관측 불가. Activation으로 근사하며 `event_seq`·`n_events`는 없다 | `WAITING` 태스크의 wakeup / 첫 실행 | 자발적 수면 진입(P1 규칙: 모든 자발적 수면) | (a) mid-job blocking이 Job을 분할한다. 분할된 조각의 응답 시간은 실제보다 **짧게** 측정되어 마감 실패를 놓칠 수 있고, 조각의 재활성화가 MIT 근사 검사에 위반으로 잡힐 수 있다. 그래서 A-06이 전제다. (b) 처리 중 도달(R2)이 보이지 않는다. (c) back-to-back Job(R3)은 수면이 없어 하나의 구간으로 병합된다. 병합 구간은 선행 Job의 $t_{act}$부터 재므로 마감 실패를 놓치지는 않지만, 마감을 지킨 후행 Job에 거짓 DMISS가 날 수 있다 | P1 |
+| **M. 애플리케이션 마커** (선택, 전송 계층 중립) | 앱(또는 앱 측 어댑터)이 도달을 통지: `event_seq` 증가, $t_{arr}$ 기록, **도달 기준 MIT 검사** | K가 관측한다. wait point 복귀 시 `n_events`를 앱에 전달(R4) | 모델상의 Completion은 wait point 진입이다. P1에서 커널이 이를 관측하는 수단은 K와 같으므로(수면 진입), K의 한계 (a)(c)가 마커 태스크에도 그대로 적용된다. wait point만을 Completion으로 식별하는 것은 P2(OI-17) | 도달 정보는 앱이 제공하므로 앱을 신뢰한다(집행은 영향받지 않음) | P1 |
 | **X. 미들웨어 경계** | 미들웨어 수신 지점에서 TIMPANI가 직접 관측 | — | — | 미들웨어별 구현 필요 | P2 |
 | **D. 선행 태스크 완료** | 파이프라인/DAG에서 선행 Job의 Completion이 후속 source의 Arrival | — | — | REQ-DD-001 | P2+ |
 
-- **집행(③)은 P1에서 항상 커널이 관측한 Activation/Start/Completion을 사용한다.** 어떤 어댑터를 쓰더라도 CBS 격리·CPU 고정·DMISS 판정은 동일하게 동작한다. 마커 어댑터는 Arrival 정보(정확한 MIT 판정, Event 계수, $t_{arr}$)와 결정적 wait point를 **추가**한다.
+- **집행(③)은 P1에서 커널이 관측한 Activation/Start/Completion을 사용한다.** 마커 태스크의 Job 경계도 P1에서는 K의 관측을 따르므로, 어떤 어댑터를 쓰더라도 CBS 격리·CPU 고정·DMISS 판정은 동일하게 동작한다. 마커 어댑터가 P1에 **추가**하는 것은 Arrival 정보(정확한 MIT 계수, Event 계수, $t_{arr}$)와 R2~R4의 유실 없는 전달(`n_events`)이다.
+- **P1 적합 조건**: 태스크가 A-06을 지키고(mid-job blocking 없음) back-to-back이 없으면(I1의 정상 조건) 커널이 관측한 구간은 모델의 Job과 일치한다. 이 조건 밖에서는 위 표의 한계가 적용되며, TIMPANI 출력의 Job 레코드는 "커널이 관측한 구간"임을 명시한다(OBS-002).
 - 한 태스크는 K만으로 동작할 수 있고(애플리케이션 투명성, DET-003), M을 함께 쓰면 관측이 정밀해진다(DET-004).
 - 참고: L1 TT 태스크의 주기 활성화는 "TIMPANI의 Timer Master가 notifier인 Event source"로 볼 수 있으며, 같은 대기/통지 구조를 공유한다. 본 문서는 L2만 다룬다.
 
@@ -164,8 +167,8 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
         ┌────────────────┴─────────────────┐
         │ 태스크 WAITING (R1)               │ 태스크 ACTIVE (R2)
         ▼                                   ▼
-  Activation(j)  t_act                 미결(pending) Event로 보관 ──┐
-        │   job_seq++, n_events = 미결 수(R4), CBS 잔여 예산 확인     │
+  Activation(j)  t_act                 미소비(pending) Event로 보관 ─┐
+        │   job_seq++, n_events = 미소비 Event 수(R4, 깨운 Event 포함) │
         ▼                                                          │
   Start(j)  t_start   ── TT Gap에서 배정 CPU 할당(CBS dispatch)       │
         │                                                          │
@@ -175,8 +178,8 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
         ▼                                                          │
   Completion(j)  t_done ── wait point 도달, R = t_done − t_rel, 마감 판정
         │                                                          │
-        ├─ 미결 Event 있음 (R3) → 즉시 Activation(j+1) ◄──────────────┘
-        └─ 미결 Event 없음 → WAITING
+        ├─ 미소비 Event 있음 (R3) → 즉시 Activation(j+1) ◄────────────┘
+        └─ 미소비 Event 없음 → WAITING
 ```
 
 ### 2.6 핵심 타이밍 파라미터
@@ -197,7 +200,7 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 | $C_s$ | = C (WCET) | 서버 예산 |
 | $T_s$ | = MIT | 보충 주기 |
 | $U_s$ | = $C_s / T_s$ | 서버 이용률 |
-| $B_{tt}(k, L)$ | CPU k에서 길이 L인 임의 윈도우 내 TT 점유 시간의 최댓값(P1 승인식은 L = L2 태스크의 D). L이 최장 연속 TT 블록 이상이면 최대 연속 TT 점유 길이와 같다 | 승인 검사의 블로킹 항(§4.3 CBS-004) |
+| $B_{tt}(k, L)$ | CPU k에서 길이 L인 임의 윈도우 내 TT 점유 시간의 최댓값(P1 승인식은 L = L2 태스크의 D). 윈도우가 여러 TT 블록을 덮으면 그 합이다 | 승인 검사의 블로킹 항(§4.3 CBS-004) |
 
 **측정 어휘** (검증 프레임워크 공통)
 
@@ -205,8 +208,8 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 |:--|:--|:--|
 | `event_seq` | source 내 Event 도달 순번 | M(마커). K만 쓰면 없음 |
 | $t_{arr}$ | Event가 source에 도달한 시각 | M. K만 쓰면 $t_{act}$로 근사 |
-| `job_seq` | 태스크 내 Job 순번 | K |
-| `n_events` | Job이 소비한 Event 수 | M |
+| `job_seq` | 태스크 내 Job 순번. P1 출력값은 커널이 관측한 구간의 순번이며 §2.4의 P1 적합 조건에서 모델 Job 순번과 같다 | K |
+| `n_events` | Job이 소비한 Event 수 | M(앱에 반환). TIMPANI 출력에서는 source의 누적 소비 수로 확인 |
 | $t_{act}$ | Job 활성화 시각 | K |
 | $t_{start}$ | Job 최초 실행 개시 시각 | K |
 | $t_{done}$ | Job 완료(wait point 도달) 시각 | K |
@@ -224,10 +227,10 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 4. 배정된 Isolated CPU에서 L1 TT 슬롯이 실행 중이 아닐 때(Gap 구간), 태스크가 디스패치되어 실행되며 사용한 CPU 시간만큼 CBS 예산이 차감된다.
 5. 태스크가 이벤트 처리를 완료하고 다음 이벤트를 기다리기 위해 wait point로 진입하면, TIMPANI-N은 이를 **Job 완료(Completion)**로 감지하고 마감(`activation_ns + deadline_us`) 준수 여부를 확인한다. 정상 조건에서 이 Job은 Event 1개를 소비한다(불변식 I1).
 
-### UC-02: 예산 소진 시 기본 Throttling 및 주기적 보충 (P1)
+### UC-02: 예산 소진 시 기본 Throttling 및 보충 (P1)
 1. 예상보다 빈번한 이벤트 발생 또는 긴 실행 시간으로 태스크의 CBS 잔여 예산(`remaining_us`)이 `0`에 도달한다.
 2. TIMPANI-N은 해당 태스크를 즉시 Throttled 큐로 이동시켜 실행을 보류함으로써, 같은 CPU의 L1 TT 태스크 및 다른 L2 CBS 태스크를 보호한다.
-3. 보충 주기($T_s = \text{MIT}$)가 경과하면 예산이 $C_s$로 회복(Replenishment)되고, 태스크는 다시 L2 큐로 승격되어 실행을 재개한다. 보충은 **다른 태스크의 활동 여부와 무관하게** 바운드된 지연 내에 이루어진다(§4.4 PRT-003).
+3. 현재 보충 윈도우(시작 시점부터 $T_s = \text{MIT}$)가 끝나면 예산이 $C_s$로 회복(Replenishment)되고 새 윈도우가 시작되며, 태스크는 다시 L2 큐로 승격되어 실행을 재개한다. 보충은 **다른 태스크의 활동 여부와 무관하게** 바운드된 지연 내에 이루어진다(§4.4 PRT-003).
 
 ### UC-03: TT + CBS 공존 하 L1 보호 (P1)
 1. 동일 Isolated CPU에 L1(TT) 태스크 A(period 20 ms, WCET 2 ms)와 L2(CBS) 태스크 X(MIT 18 ms, WCET 2 ms, D 5 ms)가 배치된다(예시 수치).
@@ -245,7 +248,7 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 
 ### UC-06: MIT 위반 버스트 (P1)
 1. 입력 측 오동작으로 X의 Event가 MIT보다 짧은 간격(예: MIT/3)으로 반복 도달한다.
-2. TIMPANI는 **도달 기준**으로 MIT 위반을 계수하고(마커 어댑터: 매 도달, 커널 관측만: 활성화 간격으로 근사), X는 CBS 예산 범위 내에서만 실행되어 L1 및 타 L2에 영향을 주지 않는다. X가 처리 중일 때 도달한 Event는 미결로 남아 다음 Job이 소비한다(R2~R4). 유실은 없으며 `n_events > 1`로 관측된다.
+2. TIMPANI는 **도달 기준**으로 MIT 위반을 계수하고(마커 어댑터: 매 도달, 커널 관측만: 활성화 간격으로 근사), X는 CBS 예산 범위 내에서만 실행되어 L1 및 타 L2에 영향을 주지 않는다. X가 처리 중일 때 도달한 Event는 미소비 상태로 남아 다음 Job이 소비한다(R2~R4). 유실은 없으며 `n_events > 1`로 관측된다.
 3. 예산 소진에 따른 스로틀링으로 발생하는 마감 실패는 **MIT 위반 연관 표식**과 함께 보고되어, 정상 격리 동작이 결함으로 오분류되지 않는다.
 
 ### UC-07: 이벤트 침묵 감시 (P2, 참고)
@@ -263,23 +266,23 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 |:--|:--|:-:|:-:|
 | **REQ-008-MOD-001** | 시스템은 외부 이벤트에 의해 비주기적으로 활성화되며 최소 도달 간격(MIT)을 가지는 Safety-Critical 워크로드를 **L2 (Sporadic + SafetyCritical)**로 분류하고, 태스크별로 `min_inter_arrival_us`, `wcet_us`, `deadline_us`를 명세할 수 있어야 한다(SHALL). MIT는 태스크의 **Event source 속성**(연속 도달의 최소 간격)이며, P1에서 Event source는 L2 태스크당 1개로 암묵 선언된다(§2.2). | High | P1 |
 | **REQ-008-MOD-002** | 시스템은 Event-Driven 태스크의 실행 단위를 **대기(Wait) → 활성화(Activation) → 실행 개시(Start) → 완료(Completion)**의 반복(Job)으로 모델링해야 하며(SHALL), 집행·폴트 판정·관측 출력을 §2.3의 생명주기 사건 4종(Arrival 포함)으로 정의해야 한다(SHALL). | High | P1 |
-| **REQ-008-MOD-003** | 시스템은 Event Job 도중의 내부 블로킹(뮤텍스, I/O, 선점) 후 재깨움을 **새 활성화로 간주하지 않아야** 하며, 한 Event Job당 활성화 시각은 정확히 1회 기록되어야 한다(SHALL). P1에서는 마커 API를 사용하는 태스크에 대해 보장하고, 마커 없는 태스크는 §4.2 DET-005의 P1 규칙과 알려진 한계를 따른다. | High | P1* |
+| **REQ-008-MOD-003** | 시스템은 Job 도중의 내부 블로킹(뮤텍스, I/O, 선점) 후 재깨움을 **새 활성화로 간주하지 않아야** 하며, 한 Job당 활성화 시각은 정확히 1회 기록되어야 한다(SHALL). P1에서는 선점·슬라이스 만료에 대해 항상 보장하고, 자발적 수면에 대해서는 A-06(mid-job blocking 없음)을 지키는 태스크에 대해 보장한다(마커 사용 여부와 무관, DET-005 P1 규칙). mid-job blocking이 있는 태스크에 대한 보장은 P2(wait point 식별, OI-17). | High | P1* |
 | **REQ-008-MOD-004** | 시스템은 L2 태스크의 타이밍 파라미터에 대해 `0 < wcet_us ≤ deadline_us ≤ min_inter_arrival_us` 를 승인 시 검증하고, 위반 시 워크로드를 거부해야 한다(SHALL). `deadline_us > min_inter_arrival_us`(arbitrary deadline)는 범위 외이다. | High | P1 |
 | **REQ-008-MOD-005** | 시스템은 MIT가 정의되지 않는 Aperiodic 워크로드를 L2로 수용하지 않아야 한다(SHALL). (DDR-001 §3 준수) | Medium | P1 |
-| **REQ-008-MOD-006** | TIMPANI의 워크로드 모델·프로토콜·라이브러리 계약은 특정 미들웨어/전송 계층의 식별자(서비스·인스턴스·토픽·이벤트 ID 등)를 포함하지 않아야 한다(SHALL). Event는 `(Event source, event_seq)`로 식별하며, P1에서 Event source의 식별자는 소비 태스크의 `(workload_id, task_id)`이다. | High | P1 |
-| **REQ-008-MOD-007** | 시스템은 **Event(도달)와 Job(처리)을 구분**해야 한다(SHALL). 한 Job은 1개 이상의 Event를 소비하고(R4), 태스크가 처리 중일 때 도달한 Event는 미결로 유지되어 **유실·중복 없이** 다음 Job에 전달되어야 한다(R2/R3; 도달을 관측할 수 있는 마커 어댑터에서 보장). 정상 조건에서 Job과 Event는 1:1이다(I1). | High | P1 |
+| **REQ-008-MOD-006** | TIMPANI의 워크로드 모델·프로토콜·라이브러리 계약은 특정 미들웨어/전송 계층의 식별자(서비스·인스턴스·토픽·이벤트 ID 등)를 포함하지 않아야 한다(SHALL). Event는 도달을 관측하는 어댑터(마커)에서 `(Event source, event_seq)`로 식별한다. 커널 관측만 쓰는 source에서는 Event가 개별 식별되지 않고 Job 활성화만 계수된다. P1에서 Event source의 식별자는 소비 태스크의 `(workload_id, task_id)`이다. | High | P1 |
+| **REQ-008-MOD-007** | 시스템은 **Event(도달)와 Job(처리)을 구분**해야 한다(SHALL). 한 Job은 1개 이상의 Event를 소비하고(R4), 태스크가 처리 중일 때 도달한 Event는 미소비 상태로 유지되어 **유실·중복 없이** 다음 Job에 전달되어야 한다(R2~R4). 이 보장은 마커 어댑터가 **수락한** 도달 통지에 대한 것이며, 통지를 수락할 수 없으면(source 미등록 등) 통지자에게 오류로 알려야 한다(SHALL). 보장의 대상은 Event의 전달(`n_events`)이고, 커널이 관측하는 Job 경계의 분리는 포함하지 않는다(OI-17). 정상 조건에서 Job과 Event는 1:1이다(I1). | High | P1 |
 | **REQ-008-MOD-008** | 생명주기 사건(Arrival/Activation/Start/Completion)의 의미는 **관측 어댑터와 무관하게 동일**해야 한다(SHALL). 어댑터의 추가·교체는 모델, 애플리케이션 계약, 관측 출력 형식을 바꾸지 않아야 하며, 어댑터별 관측 한계는 문서화되어야 한다(§2.4). | High | P1 |
 
 ### 4.2 Event 감지 및 활성화 (DET)
 
 | ID | 요구사항 명세 | 우선순위 | Phase |
 |:--|:--|:-:|:-:|
-| **REQ-008-DET-001** | TIMPANI-N은 대기(Blocked/Sleeping) 상태에 있던 L2 태스크가 이벤트 도달로 깨어나는(Wakeup / Runnable 전환) 시점을 **Event 활성화(Job Activation)**로 감지하고, 해당 시점의 단조 시계 타임스탬프(`activation_ns`)를 기록해야 한다(SHALL). | High | P1 |
-| **REQ-008-DET-002** | TIMPANI-N은 실행 중이던 L2 태스크가 이벤트 처리를 마치고 wait point에서 자발적으로 대기 상태(`!runnable`)로 전환되는 시점을 **Event Job 완료(Completion)**로 감지해야 한다(SHALL). 선점(preemption)·슬라이스 만료에 의한 정지는 완료가 아니다. | High | P1 |
+| **REQ-008-DET-001** | TIMPANI-N은 대기(`WAITING`) 상태의 L2 태스크가 깨어나 실행 가능해지는 전이(`WAITING → ACTIVE`)를 **Job 활성화(Activation)**로 감지하고, 해당 시점의 단조 시계 타임스탬프(`activation_ns`)를 기록해야 한다(SHALL). 커널 관측은 깨움의 원인이 Event 도달인지 구분하지 못하므로 A-06이 전제다. | High | P1 |
+| **REQ-008-DET-002** | TIMPANI-N은 실행 중이던 L2 태스크가 이벤트 처리를 마치고 wait point에서 자발적으로 대기 상태로 전환되는 시점을 **Job 완료(Completion)**로 감지해야 한다(SHALL). 선점(preemption)·슬라이스 만료에 의한 정지는 완료가 아니다. P1에서 이 관측은 마커 사용 여부와 무관하게 자발적 수면 진입으로 이루어진다(DET-005). | High | P1 |
 | **REQ-008-DET-003** | Event 감지 및 스케줄링 제어는 **애플리케이션 투명성(Transparency)**을 보장해야 한다(SHALL). L2 애플리케이션은 표준 리눅스 이벤트 대기 메커니즘(socket, epoll, poll, futex, condvar 등)을 그대로 사용할 수 있어야 하며, TIMPANI 전용 주기 동기화 API(`ttsched_wait_next_period()`)나 직접적인 RT 스케줄링 시스템 콜 호출을 강제받지 않아야 한다. | High | P1 |
-| **REQ-008-DET-004** | TIMPANI는 애플리케이션이 **선택적으로** 사용할 수 있는 경량·전송 계층 중립 **마커 어댑터**를 제공해야 한다(SHALL): (a) **wait** — 다음 Event를 기다리는 wait point 진입. 복귀 시 이번 Job이 소비할 Event 수(`n_events ≥ 1`)를 돌려준다(R4). 미결 Event가 있으면 대기 없이 복귀한다(R3). (b) **notify** — 지정 Event source에 Event 도달을 통지(`event_seq` 증가, 선택적으로 $t_{arr}$ 동반)하고 소비 태스크가 대기 중이면 깨운다. (c) Event source 핸들 획득. 마커가 제공하는 도달 정보는 커널 관측 추정보다 우선한다. 이는 Phase 2 미들웨어 경계 관측(REQ-FUN-009)의 주입점이 된다. | High | P1 |
-| **REQ-008-DET-005** | 마커가 없는 태스크에 대해 TIMPANI-N은 mid-job blocking과 새 활성화를 구분하는 **결정적 규칙**을 적용해야 한다(SHALL). **P1 규칙**: 모든 자발적 블로킹을 완료로, 그 후 첫 wakeup을 활성화로 간주한다(알려진 한계: mid-job blocking이 있는 앱은 job이 분할 측정됨 → 마커 사용 권고). **P2 규칙**: 블로킹 시스템 콜 분류와 블로킹 지속 시간 임계를 이용한 정밀 분류(DDR-008). | High | P1* |
-| **REQ-008-DET-006** | TIMPANI-N은 테이블 적용 시점에 존재하지 않던 L2 태스크 스레드(늦게 생성되는 워커, 컨테이너 재시작으로 PID가 바뀐 스레드)를 **스레드 생성 후 `T_bind` 이내**에 식별하여 CBS 정책을 적용해야 한다(SHALL). `T_bind` 목표값은 §4.6 TIM-006. P1은 주기적 재스캔, P2는 cgroup/Pullpiri 메타데이터 기반(REQ-NFR-004). | High | P1* |
+| **REQ-008-DET-004** | TIMPANI는 애플리케이션이 **선택적으로** 사용할 수 있는 경량·전송 계층 중립 **마커 어댑터**를 제공해야 한다(SHALL): (a) **wait** — 다음 Event를 기다리는 wait point 진입. 복귀 시 이번 Job이 소비할 Event 수(`n_events ≥ 1`)를 돌려준다(R4). 미소비 Event가 있으면 대기 없이 복귀한다(R3). (b) **notify** — 지정 Event source에 Event 도달을 통지(`event_seq` 증가, $t_{arr}$ 기록; $t_{arr}$를 주지 않으면 통지 호출 시각을 쓴다)하고 소비 태스크가 대기 중이면 깨운다. 수락할 수 없는 통지는 오류로 반환한다. (c) Event source 핸들 획득. 마커가 제공하는 도달 정보는 커널 관측 추정보다 우선한다. P1에서 마커는 커널이 관측하는 Job 경계를 바꾸지 않는다(§2.4). 이는 Phase 2 미들웨어 경계 관측(REQ-FUN-009)의 주입점이 된다. | High | P1 |
+| **REQ-008-DET-005** | TIMPANI-N은 mid-job blocking과 새 활성화를 구분하는 **결정적 규칙**을 적용해야 한다(SHALL). **P1 규칙**(마커 사용 여부와 무관): 모든 자발적 수면을 완료로, 그 후 첫 wakeup을 활성화로 간주한다. 알려진 한계: mid-job blocking이 있는 앱은 Job이 분할 측정되어 응답 시간이 과소 측정된다. 그래서 A-06이 전제다. **P2 규칙**: 마커 wait point 식별, 블로킹 시스템 콜 분류와 블로킹 지속 시간 임계를 이용한 정밀 분류(DDR-008). | High | P1* |
+| **REQ-008-DET-006** | TIMPANI-N은 테이블 적용 시점에 존재하지 않던 L2 태스크 스레드(늦게 생성되는 워커, 컨테이너 재시작으로 PID가 바뀐 스레드)를 **스레드 생성 후 `T_bind` 이내**에 식별하여 CBS 정책을 적용해야 한다(SHALL). `T_bind` 목표값은 §4.6 TIM-006. P1은 주기적 재스캔, P2는 cgroup/Pullpiri 메타데이터 기반(SRS-000 `REQ-NFR-004`). | High | P1* |
 
 ### 4.3 CBS 기반 스케줄링 동작 (CBS)
 
@@ -288,7 +291,7 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 | **REQ-008-CBS-001** | TIMPANI-O는 L2 태스크의 타이밍 명세로부터 CBS 서버 파라미터(예산 $C_s = \text{wcet\_us}$, 보충 주기 $T_s = \text{min\_inter\_arrival\_us}$)를 산출하고, 대상 Isolated CPU의 L1 TT 슬롯 배치 후 잔여 용량(Gap) 내에서 스케줄 가능성($U_{\text{tt}} + U_{\text{cbs}} + U_{\text{overhead}} \le U_{\text{bound}}$)을 검증해야 한다(SHALL). | High | P1 |
 | **REQ-008-CBS-002** | TIMPANI-N은 활성화된 L2 태스크를 배정된 Isolated CPU의 **TT Gap 구간**(L1 TT 슬롯이 비활성인 시간 구간)에서만 디스패치해야 하며, 실행 도중 L1 TT 슬롯 시작 시각이 도래하면 즉시 CPU를 양보(Slice Capping 및 Preemption)하여 L1의 시간적 결정론을 보장해야 한다(SHALL). | High | P1 |
 | **REQ-008-CBS-003** | TIMPANI-N은 L2 태스크가 CPU에서 실행될 때마다 실제 실행 시간을 추적하여 CBS 서버의 잔여 예산(`remaining_us`)을 차감해야 한다(SHALL). | High | P1 |
-| **REQ-008-CBS-004** | TIMPANI-O의 승인 검사는 이용률 조건에 더해, **D ≤ MIT인 L2 태스크에 대해 마감 충족의 충분 조건**을 검증해야 한다(SHALL). **P1 조건**(보수적 단순식): $C_{s,i} + B_{tt}(k, D_i) + L_{wake}^{max} + \sum_{j \ne i} C_{s,j} \le D_i$ (동일 CPU 타 서버 각 1 job, FIFO 가정; $B_{tt}(k, D_i)$ = 길이 $D_i$ 윈도우 내 최대 TT 점유). **P2 조건**: 윈도우 수요·공급 함수 기반 정밀식(EDF 순서). | High | P1* |
+| **REQ-008-CBS-004** | TIMPANI-O의 승인 검사는 이용률 조건에 더해, **마감 충족의 충분 조건**을 대상 CPU의 **모든** L2 태스크(새로 추가되는 태스크와 이미 배치된 태스크)에 대해 검증해야 한다(SHALL). **P1 조건**(보수적 단순식): 각 L2 태스크 $i$에 대해 $C_{s,i} + B_{tt}(k, D_i) + L_{wake}^{max} + \sum_{j \ne i} C_{s,j} \le D_i$ ($B_{tt}(k, D_i)$ = 길이 $D_i$ 윈도우 내 최대 TT 점유). 전제: 활성화 순서 FIFO(ORD-002), 그리고 다른 서버가 요청 Job보다 앞서 실행할 수 있는 양이 서버당 $C_{s,j}$ 이하라는 것. 이 전제는 PRT-001의 보충 규칙과 ORD-002가 MIT 위반·예산 초과 서버에 대해서도 보장한다. **P2 조건**: 윈도우 수요·공급 함수 기반 정밀식(EDF 순서). | High | P1* |
 | **REQ-008-CBS-005** | L2 태스크는 TIMPANI-O가 배정한 CPU에서만 실행되어야 한다(SHALL, Partitioned Scheduling — DDR-004 §1). 타 Isolated CPU로의 마이그레이션은 허용되지 않는다. | High | P1 |
 | **REQ-008-CBS-006** | CBS 예산 차감은 1 µs 해상도로 이루어져야 하며, 서버당 한 보충 주기 내 누적 **초과 실행(overrun)**은 §4.6 TIM-004의 바운드를 넘지 않아야 한다(SHALL). | High | P1* |
 
@@ -296,36 +299,38 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 
 | ID | 요구사항 명세 | 우선순위 | Phase |
 |:--|:--|:-:|:-:|
-| **REQ-008-PRT-001** | L2 태스크의 CBS 잔여 예산이 `0`이 되면, TIMPANI-N은 해당 태스크의 실행을 즉시 제한(Throttling)하고, 보충 시각(`replenish_at_ns`, 주기 $T_s$)이 도래했을 때 예산을 $C_s$로 보충하여 실행 가능 상태로 전환해야 한다(SHALL). | High | P1 |
-| **REQ-008-PRT-002** | TIMPANI-N은 L2 태스크의 Event 활성화 시각(`activation_ns`)으로부터 **Job 완료 시점**까지의 경과 시간이 `deadline_us`를 초과할 경우 이를 **Deadline Miss(`FAULT_DMISS`)**로 감지하고, 설정된 허용 임계치(`max_dmiss`) 초과 시 상위(TIMPANI-O)로 보고해야 한다(SHALL). 실행 중(runnable)인 태스크에 대해서는 마감 경과 시 **1회만** 조기 감지할 수 있으며(MAY), 동일 job에 대한 중복 보고는 금지된다. | High | P1 |
+| **REQ-008-PRT-001** | L2 태스크의 CBS 잔여 예산이 `0`이 되면, TIMPANI-N은 해당 태스크의 실행을 즉시 제한(Throttling)해야 한다(SHALL). 예산 보충은 **보충 윈도우**(길이 $T_s$) 단위로 한다: (a) Job 활성화 시점에 직전 윈도우가 끝났으면 예산을 $C_s$로 채우고 그 시점부터 새 윈도우를 시작한다. (b) 스로틀된 서버는 현재 윈도우의 끝(`replenish_at_ns`)에서 예산을 $C_s$로 채우고 그 시점부터 새 윈도우를 시작한다. 한 윈도우 안에서 서버는 $C_s$를 초과해 실행할 수 없어야 한다(SHALL). 선언을 지켜 온 서버(모든 도달이 MIT를 지키고, Job당 차감 실행 시간 — 활성화부터 wait point에서 잠들 때까지 — 이 $C_s$ 미만)의 Job은 항상 온전한 예산 $C_s$로 시작해야 한다(SHALL). MIT 위반이나 예산 초과가 있었던 서버는 빌려 쓴 예산을 이후 Job들의 여유($C_s$ − 실제 실행 시간)로 채울 때까지 이 보장을 받지 못한다: 위반의 비용은 위반한 태스크가 지고 다른 태스크로 넘어가지 않는다. 그 상태에서 활성화된 Job은 표식으로 식별할 수 있어야 한다(SHALL, PRT-007). | High | P1 |
+| **REQ-008-PRT-002** | TIMPANI-N은 L2 태스크의 Event 활성화 시각(`activation_ns`)으로부터 **Job 완료 시점**까지의 경과 시간이 `deadline_us`를 초과할 경우 이를 **Deadline Miss(`FAULT_DMISS`)**로 감지하고, 설정된 허용 임계치(`max_dmiss`) 초과 시 상위(TIMPANI-O)로 보고해야 한다(SHALL). 실행 중(runnable)인 태스크에 대해서는 마감 경과 시 **1회만** 조기 감지할 수 있으며(MAY), 동일 job에 대한 중복 보고는 금지된다. 모델의 마감 기준은 Job 해제 시각 $t_{rel}$이고(§2.3), P1 판정은 $t_{act}$를 그 근사로 쓴다(A-04: 도달에서 활성화까지의 지연만큼 낙관적). | High | P1 |
 | **REQ-008-PRT-003** | 예산 보충은 **스케줄러 활동(타 태스크의 enqueue/dispatch)에 의존하지 않고** 보충 시각으로부터 §4.6 TIM-003의 지연 바운드 내에 완료되어야 한다(SHALL). (DDR-007 §4.5 Lazy + Backup 중 Backup 경로의 필수화) | High | P1 |
-| **REQ-008-PRT-004** | TIMPANI는 Event source의 연속 **도달** 간격이 `min_inter_arrival_us`보다 짧은 경우를 **MIT 위반**으로 감지·계수해야 한다(SHALL). 도달을 관측할 수 있으면(마커 어댑터) 도달 기준으로, 그렇지 않으면(커널 관측만) 활성화 간격으로 근사한다. MIT 위반 시에도 CBS 격리는 유지되어야 하며(FFI), **P1 정책**은 "잔여 예산 내 흡수(위반 도달은 새 예산을 받지 않음)"이다. 대안 정책(지연/폐기)은 P2에서 검토한다. | High | P1 |
+| **REQ-008-PRT-004** | TIMPANI는 Event source의 연속 **도달** 간격이 `min_inter_arrival_us`보다 짧은 경우를 **MIT 위반**으로 계수해야 한다. 도달을 관측하는 source(마커 어댑터)에서는 도달 기준으로 정확히 계수해야 한다(SHALL). 커널 관측만 쓰는 source에서는 활성화 간격에 의한 **근사 지표**로 계수한다(SHOULD): 처리 중 도달은 계수되지 않고 A-06 위반 시 거짓 계수가 생길 수 있으므로 정확성 기준(AC-008-07)의 대상이 아니다. MIT 위반 시에도 CBS 격리는 유지되어야 하며(FFI, SHALL), **P1 정책**은 "잔여 예산 내 흡수(위반 도달은 새 예산을 받지 않음)"이다. 대안 정책(지연/폐기)은 P2에서 검토한다. | High | P1 |
 | **REQ-008-PRT-005** | 시스템은 다음 이상 징후를 **서로 구분되는 폴트 유형**으로 분류·보고해야 한다(SHALL): `DMISS`(마감 실패), `BUDGET_EXCEED`(예산 소진 — 정상 격리 동작, 정보성), `MIT_VIOLATION`(모델 위반) [P1]; `WAKEUP_LATENCY_EXCEED`(깨움 지연 초과), `WATCHDOG`(이벤트 침묵) [P2]. 각 유형은 TIMPANI-N → TIMPANI-O → Pullpiri 경로에서 **유형 손실 없이** 전달되어야 한다. (SRS-000 REQ-FUN-014) | High | P1* |
 | **REQ-008-PRT-006** | 정보성 이벤트(`BUDGET_EXCEED`)는 서버당 Throttle 에피소드마다 최대 1회로 **집계(rate-limit)**되어 보고되어야 하며, 폴트 보고 경로의 대역폭을 소진하지 않아야 한다(SHALL). | Medium | P1 |
-| **REQ-008-PRT-007** | MIT 위반에 기인한 스로틀링으로 발생한 `DMISS`는 보고 시 **MIT 위반 연관 표식**을 포함해야 하며(SHOULD), 상위 계층이 "모델 위반(입력 측 문제)"과 "실행 결함(워크로드 측 문제)"을 구분할 수 있어야 한다. | Medium | P1 |
+| **REQ-008-PRT-007** | `DMISS` 보고는 **MIT 위반 연관 표식**을 포함해야 한다(SHALL). 규칙: (a) 마감을 놓친 Job의 활성화 시각에서 $T_s$를 뺀 시점 이후에 같은 Event source에서 MIT 위반이 1회 이상 관측되었으면 **MIT 연관 표식**을 붙인다. (b) 그 Job이 활성화될 때 새 예산을 받지 못했으면(직전 보충 윈도우가 끝나지 않음: 이전 MIT 위반이나 예산 초과의 여파, PRT-001) **예산 이월 표식**을 붙인다. 상위 계층은 이 표식으로 "모델 위반(입력 측 문제)"과 "실행 결함(워크로드 측 문제)"을 구분한다. | Medium | P1 |
 
 ### 4.5 배치 및 순서 (ORD)
 
 | ID | 요구사항 명세 | 우선순위 | Phase |
 |:--|:--|:-:|:-:|
 | **REQ-008-ORD-001** | TIMPANI-O는 L2 태스크를 Isolated CPU에 배치할 때 CPU별 Gap 구조(최소 Gap 길이 ≥ `CBS_MIN_EXEC_US`, 최대 TT 연속 점유 $B_{tt}$)를 고려해야 하며, 배치 결과가 CBS-004의 충분 조건을 만족하지 못하면 다른 CPU를 시도하거나 거부해야 한다(SHALL). | High | P1 |
-| **REQ-008-ORD-002** | 동일 CPU에 둘 이상의 L2 서버가 존재할 때 TIMPANI-N은 **결정적 디스패치 순서 정책**을 적용해야 한다(SHALL). **P1**: 활성화 순서(FIFO). **P2**: 절대 마감 기반(EDF). 승인 검사(CBS-004)는 동일 정책을 전제로 해야 한다. | High | P1* |
+| **REQ-008-ORD-002** | 동일 CPU에 둘 이상의 L2 서버가 존재할 때 TIMPANI-N은 **결정적 디스패치 순서 정책**을 적용해야 한다(SHALL). **P1**: 활성화 순서(FIFO). 예산을 소진해 스로틀된 서버는 보충 후 큐의 맨 뒤로 들어가야 하며, 먼저 활성화되었다는 이유로 다른 서버의 Job을 다시 앞지르지 않아야 한다. **P2**: 절대 마감 기반(EDF). 승인 검사(CBS-004)는 동일 정책을 전제로 해야 한다. | High | P1* |
 | **REQ-008-ORD-003** | L2 서버 간에는 예산 격리가 성립해야 한다(SHALL). 한 L2 태스크의 예산 초과·MIT 위반이 동일 CPU의 다른 L2 태스크의 응답 시간을 승인 시 가정한 간섭 이상으로 증가시키지 않아야 한다. | High | P1 |
 
 ### 4.6 정량 타이밍 요구사항 (TIM)
+
+> 통계 기준: 백분위를 적은 항목은 그 백분위, "최댓값"으로 적은 항목(TIM-004/005/006)은 관측 구간 안의 최댓값(p100), TIM-008은 같은 구간의 평균이 기준이다. 관측 구간은 따로 적지 않으면 수용 시험 1회(정격 부하 1 h)다.
 
 > 각 항목은 측정 방법을 함께 명시한다. 목표값 중 `(후보)` 표시는 대상 HW(aarch64 — 예: Raspberry Pi 5, PREEMPT_RT 6.12, sched_ext)에서의 측정으로 확정해야 하며, 확정 전까지는 SRS-008/테스트 전략의 합부 기준으로 임시 사용한다. 관측 조건은 "Isolated CPU, 정격 부하(승인된 L1/L2 전부 활성), 1시간 연속 관측"을 기본으로 한다. 모두 P1에서 측정을 시작한다.
 
 | ID | 요구사항 명세 | 목표값 | 측정 방법 |
 |:--|:--|:--|:--|
 | **REQ-008-TIM-001** | **깨움 지연 (Gap 상태)**: 배정 CPU가 Gap이고 유휴일 때, $t_{start} − t_{act}$ 는 바운드되어야 한다(SHALL). | ≤ 50 µs @ p99.99 (후보) | BPF 트레이스($t_{act}$ at wakeup, $t_{start}$ at running) → 검증 프레임워크 히스토그램 |
-| **REQ-008-TIM-002** | **깨움 지연 (TT 점유 상태)**: TT 슬롯이 활성인 동안 도달한 이벤트의 $t_{start} − t_{act}$ 는 $B_{tt} + L_{wake}$ 를 넘지 않아야 한다(SHALL). | ≤ $B_{tt}$ + 50 µs (후보) | 동일 트레이스. $B_{tt}$는 테이블에서 계산 |
+| **REQ-008-TIM-002** | **깨움 지연 (TT 점유 상태)**: TT 슬롯이 활성인 동안 도달한 이벤트의 $t_{start} − t_{act}$ 는 $B_{tt} + L_{wake}$ 를 넘지 않아야 한다(SHALL). | ≤ $B_{tt}$ + 50 µs @ p99.99 (후보) | 동일 트레이스. $B_{tt}$는 테이블에서 계산 |
 | **REQ-008-TIM-003** | **보충 지연**: 예산 소진 후 `replenish_at_ns` 도래 시점부터 태스크가 실행 가능(L2 큐 승격 + CPU 재스케줄)해지기까지의 지연은 바운드되어야 한다(SHALL). 이벤트/디스패치 활동이 전혀 없는 조건에서도 성립해야 한다. | ≤ 100 µs @ p99.99 (후보) | Backup Replenisher 발화 시각과 BPF `remaining_us` 복원 시각의 차 |
-| **REQ-008-TIM-004** | **예산 초과 허용치**: 서버당 보충 주기 내 실제 실행 시간이 $C_s$를 초과하는 양(overrun)은 바운드되어야 한다(SHALL). | P1: ≤ 1 scheduler tick(HZ=1000 기준 1 ms); P2: ≤ 50 µs(HRTICK 채택 시, 후보) | BPF stopping에서 exec 누적 vs budget; 커널 설정(CONFIG_HZ, HRTICK)별 측정 |
-| **REQ-008-TIM-005** | **마감 실패 감지·보고 지연**: 마감 경과 후 `FAULT_DMISS`가 TIMPANI-O에 도달하기까지의 지연은 바운드되어야 한다(SHALL). | 커널 감지 ≤ 마감 + $C_s$; O 도달 ≤ 감지 + 200 ms (후보) | ringbuf 타임스탬프 vs O 수신 시각 |
-| **REQ-008-TIM-006** | **지연 식별(`T_bind`)**: DET-006의 늦은 스레드 식별 지연. | ≤ 1 s (후보) | 스레드 생성 시각 vs `task_meta_map` 등록 시각 |
+| **REQ-008-TIM-004** | **예산 초과 허용치**: 서버당 보충 주기 내 실제 실행 시간이 $C_s$를 초과하는 양(overrun)은 바운드되어야 한다(SHALL). | P1: ≤ 1 scheduler tick(HZ=1000 기준 1 ms), 최댓값; P2: ≤ 50 µs(HRTICK 채택 시, 후보) | BPF stopping에서 exec 누적 vs budget; 커널 설정(CONFIG_HZ, HRTICK)별 측정 |
+| **REQ-008-TIM-005** | **마감 실패 감지·보고 지연**: 마감을 놓친 Job이 완료된 시점부터 `FAULT_DMISS`가 TIMPANI-O에 도달하기까지의 지연은 바운드되어야 한다(SHALL). 커널 감지는 Job 완료 시점에 이루어진다. 완료 전 조기 감지는 선택(PRT-002)이므로, 스로틀·선점으로 완료가 늦어지면 감지도 그만큼 늦다. | 커널 감지: 완료 처리와 동시(동기); O 도달 ≤ 감지 + 200 ms, 최댓값 (후보) | ringbuf 타임스탬프 vs O 수신 시각 |
+| **REQ-008-TIM-006** | **지연 식별(`T_bind`)**: DET-006의 늦은 스레드 식별 지연. | ≤ 1 s, 최댓값 (후보) | 스레드 생성 시각 vs `task_meta_map` 등록 시각 |
 | **REQ-008-TIM-007** | **L1 무간섭**: L2 워크로드의 존재·폭주(P1) 및 추가·제거(P2)가 L1 TT 활성화 지터에 미치는 영향은 REQ-NFR-001 바운드 내에서 **통계적으로 무차이**여야 한다(SHALL). | L2 유/무 비교 시 p99.99 지터 차 ≤ 10 µs (후보) | Timer Master 지터 히스토그램 A/B 비교 |
-| **REQ-008-TIM-008** | **관측 오버헤드**: Event 감지(활성화 기록, MIT 검사, 마커 처리)가 이벤트당 추가하는 CPU 시간은 바운드되어야 한다(SHALL). | ≤ 2 µs/이벤트 (후보) | BPF ops 실행 시간 측정(`bpf_prog` 통계) + 마커 API 마이크로벤치 |
+| **REQ-008-TIM-008** | **관측 오버헤드**: Event 감지(활성화 기록, MIT 검사, 마커 처리)가 이벤트당 추가하는 CPU 시간은 바운드되어야 한다(SHALL). | ≤ 2 µs/이벤트, 평균 (후보) | BPF ops 실행 시간 측정(`bpf_prog` 통계) + 마커 API 마이크로벤치 |
 
 ### 4.7 인터페이스 요구사항 (IF)
 
@@ -351,8 +356,8 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 
 | ID | 요구사항 명세 | 우선순위 | Phase |
 |:--|:--|:-:|:-:|
-| **REQ-008-OBS-001** | TIMPANI-N은 L2 태스크(및 그 Event source)별로 다음 통계를 수집·노출해야 한다(SHALL): Event 도달 수·소비 수·미결 수(도달 관측 시), Job 활성화 수·완료 수, MIT 위반 수, DMISS 수, BUDGET_EXCEED 에피소드 수, 응답 시간 히스토그램, 깨움 지연 히스토그램, 보충 주기당 예산 사용량. | High | P1 |
-| **REQ-008-OBS-002** | 검증 프레임워크가 생명주기 사건을 추출할 수 있는 **트레이스 포인트**를 제공해야 한다(SHALL): Job 단위 $t_{act}$/$t_{start}$/$t_{done}$, 그리고 도달 관측 시 Event source 단위 `event_seq`·$t_{arr}$·소비 수. 모든 시각은 공통 단조 시계 기준이어야 하며, 트레이스 활성화가 TIM-008 오버헤드 바운드를 초과하지 않아야 한다. | High | P1 |
+| **REQ-008-OBS-001** | TIMPANI-N은 L2 태스크(및 그 Event source)별로 다음 통계를 수집·노출해야 한다(SHALL): Event 도달 수·소비 수·미소비 수(도달 관측 시), Job 활성화 수·완료 수, MIT 위반 수, DMISS 수, BUDGET_EXCEED 에피소드 수, 응답 시간 히스토그램, 깨움 지연 히스토그램, Job당 예산 사용량(최근·최대). | High | P1 |
+| **REQ-008-OBS-002** | 검증 프레임워크가 생명주기 사건을 추출할 수 있는 **트레이스 포인트**를 제공해야 한다(SHALL): 커널이 관측한 Job 구간 단위 $t_{act}$/$t_{start}$/$t_{done}$, 그리고 도달 관측 시 Event source 단위 누적 도달 수(`event_seq`)·누적 소비 수·가장 최근 $t_{arr}$. Event별 $t_{arr}$와 Event↔Job 대응은 P1에서 이 출력과 생성기 기록의 오프라인 대조로 얻는다. 모든 시각은 공통 단조 시계 기준이어야 하며, 트레이스 활성화가 TIM-008 오버헤드 바운드를 초과하지 않아야 한다. | High | P1 |
 | **REQ-008-OBS-003** | OBS-001 통계는 TIMPANI-O로 주기 보고(`NodeStatus`)되어 노드 간 비교가 가능해야 한다(SHOULD). | Medium | P2 |
 
 ### 4.10 비기능 요구사항 (NFR)
@@ -361,7 +366,7 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 |:--|:--|:-:|:-:|
 | **REQ-008-NFR-001** | 노드당 최소 32개, CPU당 최소 8개의 L2 태스크를 지원해야 한다(SHALL). | Medium | P1 |
 | **REQ-008-NFR-002** | Event 감지·보충·폴트 감지의 RT 임계 경로에는 gRPC·힙 할당·블로킹 I/O가 없어야 한다(SHALL). (DDR-006 §4) | High | P1 |
-| **REQ-008-NFR-003** | L2 지원 추가로 인해 L1 전용 구성의 동작·성능이 변하지 않아야 한다(SHALL, 회귀 금지). | High | P1 |
+| **REQ-008-NFR-003** | L2 지원 추가로 인해 L1 전용 구성의 동작·성능이 변하지 않아야 한다(SHALL, 회귀 금지). 예외: `libttsched`의 SHM ABI가 바뀌므로(C-03과 같은 유형) `libttsched`를 링크한 L1 앱은 다시 빌드해야 하며, 동작·성능 기준은 다시 빌드한 뒤에 적용한다. | High | P1 |
 | **REQ-008-NFR-004** | 설계는 QNX 등 타 RTOS로의 이식을 고려하여 Event 감지 지점을 OS 추상화 경계 뒤에 두어야 한다(SHOULD). (SRS-000 REQ-ENV-004) | Low | P2 |
 | **REQ-008-NFR-005** | 프로토콜 변경은 기존 필드 번호를 유지하고 새 필드만 추가하여 **와이어 호환**을 유지해야 한다(SHALL). | High | P1 |
 
@@ -371,20 +376,20 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 
 | ID | 기준 | 합격 조건 | 검증 수단 | 관련 요구사항 | Phase |
 |:--|:--|:--|:--|:--|:-:|
-| **AC-008-01** | Event 관측 및 비침투성 | (a) 마커 어댑터 사용 L2 워크로드: 100,000회 Event 도달에 대해 도달 계수(`event_seq`) 누락·중복 0건, 소비 누락 0건(Σ `n_events` = 도달 수), MIT 준수 구간에서 Job 수 = 도달 수(I1). (b) TIMPANI 전용 API 없이 표준 블로킹 호출(socket/epoll/timerfd)로 대기하는 L2 워크로드가 `SCHED_EXT` CBS 태스크로 등록되고 이벤트마다 활성화·디스패치됨 | 범용 이벤트 생성기(마커/표준 경로) + 트레이스 | DET-001~004, MOD-003/007 | P1 |
+| **AC-008-01** | Event 관측 및 비침투성 | (a) 마커 어댑터 사용 L2 워크로드: 100,000회 Event 도달에 대해 도달 계수(`event_seq`) 누락·중복 0건, 소비 누락 0건(source의 누적 소비 수 = 도달 수), 그리고 MIT 준수·$R \le D$·A-06 준수 구간에서 Job 레코드 수 = 도달 수(I1). (b) TIMPANI 전용 API 없이 표준 블로킹 호출(socket/epoll/timerfd)로 대기하는 L2 워크로드가 `SCHED_EXT` CBS 태스크로 등록되고 이벤트마다 활성화·디스패치됨 | 범용 이벤트 생성기(마커/표준 경로) + 트레이스 | DET-001~004, MOD-003/007 | P1 |
 | **AC-008-02** | TT + CBS 공존 및 L1 보호 | 동일 Isolated CPU의 L1/L2 공존 1시간 관측에서 L1 TT 활성화 지터 p99.99가 L2 없을 때 대비 +10 µs 이내, L1 DMISS 0건(기동 직후 안정화 구간 제외) | Timer Master 지터 히스토그램 A/B | CBS-002, TIM-007 | P1 |
 | **AC-008-03** | 예산 차감 및 Throttling | 예산 소진 즉시 Throttled 전환, 보충 주기 내 overrun ≤ TIM-004(P1), 보충 지연 ≤ TIM-003 (이벤트 무도달 조건 포함) | 범용 이벤트 생성기(실행 시간 초과 주입) + BPF 맵 샘플링 | CBS-003/006, PRT-001/003 | P1 |
-| **AC-008-04** | Deadline Miss 감지 | 단일 job 실행 시간이 D 초과 시 `FAULT_DMISS` 1회 감지, `max_dmiss` 초과 시 TIMPANI-O 수신까지 ≤ TIM-005; 동일 job 중복 보고 0건 | 범용 이벤트 생성기(D 초과 실행 주입) | PRT-002, TIM-005 | P1 |
+| **AC-008-04** | Deadline Miss 감지 | 응답 시간($t_{done} − t_{act}$)이 D를 초과한 Job마다 `FAULT_DMISS` 1회 감지. 실행 시간 초과로 인한 경우와, 실행 시간은 D 미만이지만 스로틀·TT 선점으로 지연된 경우를 모두 포함한다. `max_dmiss` 초과 시 TIMPANI-O 수신까지 ≤ TIM-005; 동일 job 중복 보고 0건. 전제: A-06 | 범용 이벤트 생성기(D 초과 실행 주입, 스로틀 유발 주입) | PRT-002, TIM-005 | P1 |
 | **AC-008-05** | 깨움 지연 바운드 | Gap 조건 $t_{start}−t_{act}$ p99.99 ≤ TIM-001, TT 점유 조건 ≤ TIM-002 | 이벤트 생성기 + BPF 트레이스 | TIM-001/002 | P1 |
 | **AC-008-06** | CPU 고정 | 1시간 관측에서 L2 태스크가 배정 CPU 외에서 실행된 횟수 0 | `sched_switch` 트레이스 | CBS-005 | P1 |
-| **AC-008-07** | MIT 위반 격리 | MIT/3 간격 버스트 주입 시 `MIT_VIOLATION` 계수 정확(±0; 마커 어댑터의 도달 기준), 도달 Event 유실 0(Σ `n_events` = 도달 수), L1 DMISS 0, 타 L2 응답시간 승인 가정 내, 위반 연관 `DMISS`에 표식 존재 | 범용 이벤트 생성기(버스트 주입) | PRT-004/005/007, ORD-003, MOD-007 | P1 |
-| **AC-008-08** | 승인 제어 | $C_{s,i} + B_{tt}(k, D_i) + L_{wake}^{max} + \sum_{j \ne i} C_{s,j} > D_i$ 인 L2 요청은 거부(CBS-004 P1식); 거부된 요청이 기존 테이블을 훼손하지 않음 | GTest(timpani-o) | CBS-004, ORD-001 | P1 |
+| **AC-008-07** | MIT 위반 격리 | MIT/3 간격 버스트 주입 시 `MIT_VIOLATION` 계수 정확(±0; 마커 어댑터의 도달 기준), 도달 Event 유실 0(source의 누적 소비 수 = 누적 도달 수), L1 DMISS 0, 타 L2 응답시간 승인 가정 내, 위반 연관 `DMISS`에 표식 존재 | 범용 이벤트 생성기(버스트 주입) | PRT-004/005/007, ORD-003, MOD-007 | P1 |
+| **AC-008-08** | 승인 제어 | $C_{s,i} + B_{tt}(k, D_i) + L_{wake}^{max} + \sum_{j \ne i} C_{s,j} > D_i$ 인 태스크가 대상 CPU의 L2 태스크 중 하나라도 생기는 요청은 거부(CBS-004 P1식, 기존 태스크 포함); 승인된 추가 후에도 같은 CPU의 기존 L2 태스크 전부가 조건을 만족; 거부된 요청이 기존 테이블을 훼손하지 않음 | GTest(timpani-o) | CBS-004, ORD-001 | P1 |
 | **AC-008-09** | 런타임 추가/제거 | 실행 중 L2 추가/제거 10회 반복 동안 데몬 재시작 없음, 제거 후 잔존 BPF 상태 0 (P1); 기존 L1/L2 활성화 누락 0 (P2) | 통합 테스트 | RTU-001/004 (P1), RTU-002/003 (P2) | P1 / P2 |
 | **AC-008-10** | 늦은 스레드 식별 | 테이블 적용 후 생성된 워커 스레드가 `T_bind` 내 CBS 적용 | 통합 테스트 | DET-006, TIM-006 | P1 |
 | **AC-008-11** | 폴트 유형 보존 및 속도 제한 | `BUDGET_EXCEED`/`MIT_VIOLATION`이 Pullpiri 수신 시 유형 그대로 도달; `BUDGET_EXCEED`는 에피소드당 ≤ 1건 | mock_pullpiri 수신 로그 | PRT-005/006, IF-004 | P1 |
-| **AC-008-12** | 전송 계층 중립·공통 모델 | TIMPANI 코어(O/N/BPF/libttsched)에 미들웨어 식별자 참조 0건; 동일한 L2 워크로드를 서로 다른 전달 수단(예: 소켓, 파이프, 타이머, 마커 통지)으로 구동해도 TIMPANI 설정·코드 변경 없이 AC-01~07이 성립; FCW 샘플의 SOME/IP 처리가 앱 어댑터에만 존재 | 코드 리뷰 + grep + 범용 이벤트 생성기 소스 전환 | MOD-006/008, IF-005 | P1 |
+| **AC-008-12** | 전송 계층 중립·공통 모델 | TIMPANI 코어(O/N/BPF/libttsched)에 미들웨어 식별자 참조 0건; 동일한 L2 워크로드를 서로 다른 전달 수단(예: 소켓, 파이프, 타이머, 마커 통지)으로 구동해도 TIMPANI 설정·코드 변경 없이 어댑터와 무관한 기준(AC-008-01(b), AC-008-02~06)이 성립(AC-008-01(a)와 AC-008-07의 도달 기준 계수는 마커 어댑터에서 검증); FCW 샘플의 SOME/IP 처리가 앱 어댑터에만 존재 | 코드 리뷰 + grep + 범용 이벤트 생성기 소스 전환 | MOD-006/008, IF-005 | P1 |
 
-> 수용 기준의 검증 수단은 전송 계층 중립인 **범용 이벤트 생성기**(HLD-008 §8.3 `evttask`)를 기준으로 한다. FCW 샘플은 같은 기준을 자신의 이상 주입 옵션으로 재현하며, 옵션 대응은 HLD-008 §8.2에 둔다.
+> 수용 기준의 검증 수단은 전송 계층 중립인 **범용 이벤트 생성기**(HLD-008 §8.5 `evttask`)를 기준으로 한다. FCW 샘플은 같은 기준을 자신의 이상 주입 옵션으로 재현하며, 옵션 대응은 HLD-008 §8.2에 둔다.
 
 ---
 
@@ -392,7 +397,7 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 
 | 본 문서 ID | SRS-000 요구사항 ID | 관련 DDR | 비고 |
 |:--|:--|:--|:--|
-| `REQ-008-MOD-001`~`006` | `REQ-FUN-001`, `REQ-FUN-002` | DDR-001, DDR-008 | Sporadic + SafetyCritical (L2) 모델, Aperiodic 제외, 전송 계층 중립 |
+| `REQ-008-MOD-001`~`008` | `REQ-FUN-001`, `REQ-FUN-002` | DDR-001, DDR-008 | Sporadic + SafetyCritical (L2) 모델, Aperiodic 제외, 전송 계층 중립 |
 | `REQ-008-DET-001`~`006` | `REQ-NFR-003`, `REQ-NFR-004`, `REQ-FUN-009`(주입점) | DDR-002, DDR-005, DDR-008 | 커널 레벨 Event 감지, 투명성, 마커 인터페이스, 지연 식별 |
 | `REQ-008-CBS-001`, `004` | `REQ-FUN-013` | DDR-004, DDR-007, DDR-008 | 오프라인 CBS 예산 할당 및 Feasibility 검사(응답시간 조건 포함) |
 | `REQ-008-CBS-002`, `003`, `005`, `006` | `REQ-FUN-004`, `REQ-NFR-002` | DDR-002, DDR-005, DDR-007 | TT Gap 기반 CBS 런타임 집행, 파티션 고정, FFI |
@@ -428,10 +433,10 @@ Event(도달)와 Job(처리)은 서로 다른 개념이다. MIT는 Event에, WCE
 |:--|:--|:--|
 | A-01 | Linux 6.12+, `sched_ext`, PREEMPT_RT, cgroup v2 isolated partition | SRS-000 REQ-ENV-001~003 |
 | A-02 | L2 태스크는 Isolated CPU에서만 실행되며 L3/L4는 Non-Isolated CPU에 있다 | DDR-002 §5 |
-| A-03 | L2 태스크 스레드는 `task_id`와 동일한 comm 이름을 가진다(P1 식별 수단). cgroup/Pullpiri 메타데이터 기반 식별은 REQ-NFR-004에 따라 P2 | DDR-005 User App Interface |
-| A-04 | P1의 집행·바운드 판정은 커널이 관측한 $t_{act}$를 Job 해제 시각 $t_{rel}$의 근사로 사용한다. 마커로 도달 정보($t_{arr}$, `event_seq`)가 제공되면 기록·보고하고 MIT 판정에 사용하되, DMISS·깨움 지연 판정은 $t_{act}$ 기준이다. back-to-back Job은 병합 관측되어 보수적으로 판정된다 | §2.3, §2.4 |
+| A-03 | L2 태스크 스레드는 `task_id`와 동일한 comm 이름을 가진다(P1 식별 수단). Linux comm 제한에 따라 `task_id`는 15바이트 이하여야 하고 노드 안에서 유일해야 한다. cgroup/Pullpiri 메타데이터 기반 식별은 SRS-000 `REQ-NFR-004`에 따라 P2 | DDR-005 User App Interface |
+| A-04 | P1의 집행·바운드 판정은 커널이 관측한 $t_{act}$를 Job 해제 시각 $t_{rel}$의 근사로 사용한다. 마커로 도달 정보($t_{arr}$, `event_seq`)가 제공되면 기록·보고하고 MIT 판정에 사용하되, DMISS·깨움 지연 판정은 $t_{act}$ 기준이다. back-to-back Job은 병합 관측되며 후행 Job에 거짓 DMISS가 날 수 있다(§2.4 K-(c)) | §2.3, §2.4 |
 | A-05 | `U_bound`, `U_overhead`, `CBS_MIN_EXEC_US`는 DDR-004/007의 후보값(0.80 / 0.02 / 100 µs)을 그대로 사용하며, 확정은 해당 DDR의 오픈 아이템에 따른다 | DDR-004 §5, DDR-007 §11 |
-| A-06 | P1에서 마커 없는 L2 태스크는 mid-job blocking을 하지 않는다고 가정한다(DET-005 P1 규칙). 이 가정이 깨지는 앱은 마커 API를 사용한다 | §4.2 |
+| A-06 | P1에서 L2 태스크는 **마커 사용 여부와 무관하게** mid-job blocking(뮤텍스 경합에 의한 수면, 블로킹 I/O 등)을 하지 않는다고 가정한다(DET-005 P1 규칙). 가정이 깨지면 Job이 분할 측정된다(§2.4 K-(a)). wait point 식별로 이 가정을 없애는 것은 P2(OI-17) | §4.2 |
 | C-01 | sched_ext 슬라이스 만료는 스케줄러 틱 또는 HRTICK에 의존한다. TIM-004 P1 값은 HZ=1000을 가정한다 | §4.6 |
 | C-02 | BPF에서 futex wake를 직접 호출할 수 없으므로, 사용자 공간 보조 스레드(Replenisher)가 필요하다 | DDR-007 §4.5 |
 | C-03 | proto 인터페이스 변경은 명시적 승인이 필요하며, 필드 번호 유지·추가만 허용한다 | `.github/copilot-instructions.md`, NFR-005 |
@@ -450,7 +455,7 @@ P1 검증 후 다음 항목을 후속 리비전에서 구체화한다.
 5. **미들웨어 디스패치 경계 관측**(`REQ-FUN-009`, `REQ-ED-001`): 마커로 주입된 $t_{arr}$ 기반 E2E/MIT 정밀 감시. TIMPANI 코어는 여전히 미들웨어 중립.
 6. **이벤트 침묵(Watchdog) 감시 및 TT floor 결정**(`REQ-FUN-006`), **깨움 지연 초과 폴트**(`WAKEUP_LATENCY_EXCEED`).
 7. **HRTICK 기반 예산 정밀도**(TIM-004 P2).
-8. **cgroup/Pullpiri 메타데이터 기반 식별**(`REQ-NFR-004`), **NodeStatus 통계 보고**(OBS-003).
+8. **cgroup/Pullpiri 메타데이터 기반 식별**(SRS-000 `REQ-NFR-004`), **NodeStatus 통계 보고**(OBS-003).
 9. **Arbitrary deadline (D > MIT)**, **파이프라인/DAG 활성화**(`REQ-DD-001`).
 
 ---
@@ -488,14 +493,16 @@ P1 검증 후 다음 항목을 후속 리비전에서 구체화한다.
 | OI-1 | 마커 없는 태스크의 mid-job blocking 정밀 구분 규칙(DET-005 P2): 시스템 콜 분류 집합, 블로킹 지속시간 임계 | 응답시간 측정 정확도 | DDR-008 후속 | P2 |
 | OI-2 | EDF 순서(ORD-002 P2) 도입 시 승인식·BPF vtime 설계 | 승인식·dispatch | DDR-008 후속 | P2 |
 | OI-3 | MIT 위반 처리 대안 정책(지연/폐기) 필요성 | 격리 vs 지연 | DDR-008 후속 | P2 |
-| OI-4 | CBS 보충 의미론: 현행 "주기 격자 정렬 보충" 유지 vs 활성화 기준 보충(sporadic-server식). P1 결정 필요 | 승인식, BPF 변경 범위, 버스트 하 간섭 상한 | DDR-008 D-04 (P1: 격자 정렬 보충 유지로 결정 → 종결; 활성화 기준 보충 전환 여부는 DDR-008 F-2) | P1(종결) / P2 |
+| OI-4 | CBS 보충 의미론 — **종결(P1)**: DDR-008 D-04에서 **활성화 기준 보충 윈도우**로 결정. 현행 "주기 격자 정렬 보충"은 MIT를 지키는 태스크도 스로틀시켜 마감을 놓치게 할 수 있어 기각 | 승인식, BPF 변경 범위, 버스트 하 간섭 상한 | DDR-008 D-04 | P1(종결) |
 | OI-5 | TIM-001~008 목표값 확정을 위한 측정 환경·절차(RPi5 기준) | 합부 기준 | 테스트 전략 | P1 |
 | OI-6 | TIM-004 P2 달성을 위한 커널 요건(HRTICK) 채택 여부 | 배포 요건 | DDR-008 후속 / SRS-000 REQ-ENV | P2 |
 | OI-7 | 폴트 보고 경로 비동기화(현재 NodeStream 리더 스레드에서 동기 `NotifyFault`) | TIM-005, 노드 스트림 안정성 | DDR-012 개정 | P2 |
 | OI-8 | `period` 재사용 하위 호환 전환 기간(IF-001) | Pullpiri 연동 | Pullpiri 협의 | P1 |
 | OI-9 | 백업 보충의 CPU 재스케줄 유발 메커니즘(BPF syscall 프로그램의 `scx_bpf_kick_cpu` vs 보조 스레드 깨움) 가용성 PoC | PRT-003 구현 | DDR-008 | P1 |
 | OI-16 | 태스크당 여러 Event source의 명시 선언(proto `EventSourceInfo`, source별 MIT)과 CBS 서버 파라미터 산출 | 워크로드 모델, 승인식 | DDR-008 후속 | P2 |
-| OI-17 | back-to-back Job(R3) 경계의 커널 관측 수단(수면 없는 wait 복귀를 커널이 알 수 있게 하는 방법) | 응답 시간 측정 정밀도 | DDR-008 후속 | P2 |
+| OI-17 | 마커 wait point의 커널 식별: wait point만을 Completion으로 인정하여 A-06을 없애고, 수면 없는 back-to-back 복귀(R3)의 Job 경계도 커널이 알 수 있게 하는 방법 | Job 경계·응답 시간 측정 정밀도, 거짓 DMISS | DDR-008 후속 | P2 |
+
+> OI-10~OI-15는 SRS-008 §9에서 관리한다(번호 체계 공유). OI-1과 SRS-008 OI-10은 같은 P2 주제(마커 없는 태스크의 wait point 분류)의 요구사항 측면과 구현 지점 측면이다.
 
 ---
 
@@ -506,22 +513,23 @@ P1 검증 후 다음 항목을 후속 리비전에서 구체화한다.
 - 그 초안은 SOME/IP를 코어 계약에 직접 언급했고, 그 결과 `libtimpani_rt`가 service/instance/event ID를 인자로 받는 API, 자체 SHM(`/timpani_rt`), 라이브러리 측 MIT·E2E 폴트 판정(3 ms 하드코딩)을 갖게 되었다. TIMPANI-N은 이들을 소비하지 않으므로 현재 "라이브러리 로그"에 머문다.
 - PR #51의 스레드 이름 식별은 본 요구사항(DET-006 P1의 전제)과 부합하며 유지한다.
 
-### 12.2 가이드 방향 (상세는 HLD-008 §샘플 앱 가이드, LLD-008)
-본 설계가 확정되면 샘플 앱에 다음 방향의 변경 가이드를 제공한다.
+### 12.2 가이드 방향 (상세는 HLD-008 §8, LLD-008 §7)
+Phase 1 설계는 FCW 한 가지가 아니라 여러 종류의 Event를 같은 방법으로 다룰 수 있어야 한다. 그래서 가이드는 두 층으로 제공한다: (a) 임의의 Event 종류를 공통 모델에 올리는 **적용 방법론**(HLD-008 §8.1 계약, §8.2 절차, §8.3 Event 종류별 적용표), (b) 그 방법론을 FCW 예제에 적용한 **파일별 수정 가이드**와 실행별 기대 관측(HLD-008 §8.4, 코드 스케치는 LLD-008 §7.2). 아래 표는 (b)의 방향을 요약한 것이다.
 
 | 항목 | 현행(PR #50/52) | 가이드 방향 (P1) |
 |:--|:--|:--|
 | 이벤트 등록 | `timpani_evt_register(wl, task, svc, inst, evt, mit)` | 제거. TIMPANI는 Pullpiri `SchedInfo`(MIT 필드)로만 L2를 안다. 미들웨어 구독은 앱이 처리 |
-| 도달 표시 | `timpani_evt_mark_arrival(svc, inst, evt, seq)` → 자체 SHM | `ttsched_evt_notify(src, t_arr_ns)` (중립 마커, DET-004(b)) — 수신 스레드(vsomeip 콜백)에서 호출. `src`는 초기화 때 `ttsched_evt_open(task_id)`로 얻는 Event source 핸들 |
+| 도달 표시 | `timpani_evt_mark_arrival(svc, inst, evt, seq)` → 자체 SHM | `ttsched_evt_notify(src, t_arr_ns)` (중립 마커, DET-004(b)) — 수신 스레드(vsomeip 콜백)에서 큐에 넣은 뒤 호출. −1이 반환되면 방금 넣은 항목이 처리되지 않게 한다(큐에서 빼거나 무효로 표시한다. 계수되지 않았으므로). `src`는 초기화 때 `ttsched_evt_open(task_id)`로 얻는 Event source 핸들 |
 | 워커 wait point | `std::condition_variable` 대기 | `n = ttsched_evt_wait()` (DET-004(a)) 후 큐에서 n건 처리. 또는 표준 블로킹 유지(그 경우 A-06 준수) |
 | CBS bind/unbind | `timpani_cbs_bind_thread/unbind` (스케줄링 효과 없음) | 제거. Job 경계는 wait point로, 도달은 notify로 결정됨 |
 | MIT·E2E 판정 | 라이브러리 내부(3 ms 하드코딩) | 제거. TIMPANI-N이 `MIT_VIOLATION`/`DMISS`를 판정·보고(PRT-004/005). 앱은 자체 로그만 유지 가능 |
 | 서버 키 해시 | `FNV("wl:task")` | 앱에서 해시 불필요(제거) |
 | 워크로드 등록 | `mock_pullpiri.yaml` SPORADIC, `period`=MIT | MIT 전용 필드 사용(IF-001). 전환 기간 `period` 허용 |
-| 이상 주입 옵션 | `--burst-ms`, `--overrun-ms`, `-be`, `--wakeup-delay-ms`, `--tt-overrun-ms` | 유지. AC-008-03/04/07을 FCW에서 재현하는 수단(기준 검증 수단은 범용 이벤트 생성기) |
+| 이상 주입 옵션 | `--burst-ms`, `--overrun-ms`, `-be`, `--wakeup-delay-ms`, `--tt-overrun-ms` | 유지. AC-008-03/04/07을 FCW에서 재현하는 수단(기준 검증 수단은 범용 이벤트 생성기). 단 `--wakeup-delay-ms`의 지연은 워커가 아니라 수신 측(notify 전)으로 옮긴다: 워커 안의 수면은 A-06 위반이다 |
+| 앱 큐·로그 | 워커와 수신 스레드가 같은 뮤텍스를 잡는 큐, Job 안에서 `std::cout` | 워커가 잠들지 않는 큐(단일 생산자·단일 소비자 링 버퍼), 로그 출력은 다른 스레드(A-06) |
 | 검증 | 앱 stdout 로그 | TIMPANI-N 트레이스 채널(OBS-002) 기준으로 판정. 앱 로그는 보조 |
 
 ### 12.3 역할 분담 원칙
-- **TIMPANI 저장소**: 요구사항·설계 확정 → `timpani-o`/`timpani-n`/`libttsched` 구현 → 샘플 앱 변경 가이드 발행.
+- **TIMPANI 저장소**: 요구사항·설계 확정 → `timpani-o`/`timpani-n`/`libttsched` 구현 → Event 종류 적용 방법론과 샘플 앱 변경 가이드 발행(HLD-008 §8).
 - **샘플 앱(FCW)**: 가이드에 따라 어댑터(vsomeip ↔ 마커 API)로 축소. SOME/IP 고유 코드는 `examples/someip` 안에만 존재.
 - 두 작업은 **설계 확정 이후** 병행하되, 인터페이스(마커 API 시그니처, proto 필드)는 LLD-008 확정본을 단일 기준으로 삼는다.
