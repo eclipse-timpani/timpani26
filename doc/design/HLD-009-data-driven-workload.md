@@ -1,0 +1,174 @@
+<!--
+SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+SPDX-License-Identifier: MIT
+-->
+
+# HLD-009: Data-Driven Workload — Phase 0 High-Level Architecture Design
+
+**Date:** 2026-10-27
+**Last Updated:** 2026-11-01
+**Status:** Draft — Phase 0 design proposal (not a declaration that the current implementation is compliant)
+**Parent Baseline:** [REQ-009](REQ-009-data-driven-workload.md) §1.5, §7.1, §8.2, [SRS-009](SRS-009-data-driven-workload.md)
+**Decisions / Details:** [DDR-009](DDR-009-data-driven-workload.md), [LLD-009](LLD-009-data-driven-workload.md), [DDR-011](DDR-011-runtime-table-update.md)
+
+---
+
+## 1. Scope and Architecture
+
+This document defines the flow of a **Data-Driven DAG that is independent of a Task's existing L1 TT/L2 CBS layer** on a single node with a fixed `Epoch`/`Hyperperiod`, under basic chain conditions. A Source/Successor role does not determine the execution layer. Precise per-layer Window/Gap control, multiple periods, updates, and `SKIP` are deferred to subsequent phases.
+
+```mermaid
+flowchart LR
+    subgraph ControlPlane["Control Plane (non-RT)"]
+        IN["Pullpiri / Test Input<br/>(Pipeline DAG declaration)"]
+        TO["Timpani-O<br/>(DAG validation + existing TT/CBS placement for each Task)"]
+    end
+
+    subgraph NodeUserspace["Timpani-N & Workload (userspace)"]
+        TN_PREP["Timpani-N non-RT preparation<br/>(common DAG verification · TT/CBS representation registration · SHM publication)"]
+        TM["Timer Master<br/>(L1 TT slot adapter)"]
+        SHM[("/timpani_ttsched SHM<br/>(tasks[] + common pipeline[])")]
+        TASKS["Pipeline Tasks<br/>(L1 TT or L2 CBS)"]
+    end
+
+    subgraph KernelSpace["Linux Kernel (sched_ext)"]
+        BPF["scx_timpani<br/>(TT adapter + CBS adapter)"]
+    end
+
+    IN -->|"schedinfo.proto"| TO
+    TO -->|"node_control.proto (full_table)"| TN_PREP
+    TN_PREP --> TM
+    TN_PREP -->|"TT/CBS BPF Maps"| BPF
+    TN_PREP -->|"stable generation publication"| SHM
+    TM -->|"L1 dispatch gate"| SHM
+    SHM -->|"ALL ready / dispatch wake"| TASKS
+    TASKS -->|"pipeline[] CAS + signal_ready"| SHM
+    TASKS -->|"Runnable: preserve Task class"| BPF
+    BPF -->|"dispatch in TT slot or CBS Gap"| TASKS
+```
+
+---
+
+## 2. Component Responsibility Separation (RT / Non-RT and O / N Boundaries)
+
+| Component | Phase 0 Responsibility | Does Not Do |
+|:---|:---|:---|
+| **Input / Test Harness** | Submit a same-period (`100ms`) DAG through the `Timpani-O` input path, collect timestamp and overhead evidence, and abort the test when prerequisites are violated. | Inject a table/graph directly into `Timpani-N` or SHM and treat that as End-to-End success, or guarantee product Fail-Safe behavior instead of the product. |
+| **`Timpani-O`** | Independently validate the DAG and the Task's existing `TemporalClass`, and generate the TT/CBS representation and common DAG metadata. | Force an execution layer from the DAG role or delegate placement decisions to N. |
+| **`Timpani-N` Non-RT** | Locally verify and publish the layer-specific entries and common `pipeline[]`. | Recalculate DAG/TT/CBS feasibility. |
+| **`Timer Master`** | Open the dispatch adapter when Data-Driven ready exists in an allowed slot for an L1 Task. | Handle L2 release or execute an L1 Task when no ready state exists. |
+| **`libttsched` / App** | Perform class-independent `ALL` CAS/ready sequence updates and identity verification. | Deliver payloads, execute a control wake, or change the execution layer. |
+| **`scx_timpani`** | Dispatch L1 through the TT slot/Window and L2 through the CBS budget/Gap using the existing paths. | Create a separate Data-Driven scheduling layer. |
+| **`Fault Monitor`** | Retain the existing system-monitoring safety mechanisms. | Collect and report the new Phase 0 `DATA_TIMEOUT` (deferred to Phase 2). |
+
+Common DAG metadata transmission, the appended SHM `pipeline[]`, and new APIs are incorporated after prior approval. The existing TT/CBS entries and timing policies are retained for each Task.
+
+---
+
+## 3. High-Level Design Areas (H-DD-P0-01 ~ H-DD-P0-04)
+
+### 3.1 H-DD-P0-01 — Offline Candidate Validation and Deterministic Topological Placement (`Timpani-O`)
+
+O validates the DAG and creates common dependency metadata for each Task hash. Each Task retains the existing `TtSlot` or `CbsConfig` representation according to its input `TemporalClass`. The execution layer is not inferred from the presence or absence of `predecessors`.
+
+Phase 0 uses the existing TT slot/CBS admission policy. Phase 1 sums the per-layer response times in a mixed DAG and specifies the required Window/Gap conditions. On failure, the committed model is retained.
+
+### 3.2 H-DD-P0-02 — Node-Local Suitability Verification and Stable SHM Publication (`Timpani-N`)
+
+N verifies the Task's TT/CBS representation and the common DAG metadata separately. It rejects the candidate if any name, hash, or CPU/slot/budget reference is invalid.
+
+The accepted table is populated with the common `pipeline[]` according to the 011 contract. Adapter metadata is registered so that an L1 Task uses the TT gate and an L2 Task uses the CBS gate. Publication itself does not increment the ready/dispatch sequence.
+
+### 3.3 H-DD-P0-03 — Common Ready/Dispatch State Transitions and Control-Wake Separation
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING_DATA: stable publication initialization (ready_mask = 0)
+
+    WAITING_DATA --> PARTIAL_READY: some predecessors ready
+    PARTIAL_READY --> PARTIAL_READY: repeated/additional ready (not satisfied)
+
+    WAITING_DATA --> DISPATCHING: ALL CAS consumption -> ready sequence increments
+    PARTIAL_READY --> DISPATCHING: last ready -> ALL CAS consumption
+
+    DISPATCHING --> RUNNING: TT slot gate or CBS release gate
+    RUNNING --> WAITING_DATA: process and signal_ready to Successor, then wait again
+```
+
+- `ALL` creates only the ready sequence. The L1 adapter opens the dispatch sequence only when an allowed TT slot/Window is open, and the L2 adapter opens it only under the CBS release/budget/Gap conditions.
+- A control wake or a dispatch gate with no ready state does not lead to execution.
+
+### 3.4 H-DD-P0-04 — End-to-End (E2E) Execution Sequence
+
+#### (a) Normal Chain Sequence (Task Class Is Independently Selected as TT/CBS from the Input)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Source A/B
+    participant SHM as /timpani_ttsched
+    participant D as Successor
+    participant A as TT/CBS adapter
+    participant BPF as scx_timpani
+
+    Note over P: The Source starts through an L1 TimerMaster or an L2 Event release
+    P->>SHM: publish output, then signal_ready -> update ready bit
+    SHM->>SHM: if this is the last input, ALL CAS + ready sequence++
+    alt D is L1 TT
+        A->>SHM: check pending ready in an allowed TT slot/Window
+        A->>D: dispatch wake
+    else D is L2 CBS
+        A->>D: CBS release wake
+    end
+    D->>BPF: Runnable, retain the original Task class
+    BPF-->>D: execute in a TT slot or CBS Gap
+    D->>SHM: after processing, signal_ready to the next Successor
+```
+
+Even when the graph is the same, Task classes can differ. Phase 0 tests include TT→TT, TT→CBS, CBS→TT, and CBS→CBS connections.
+
+#### (b) Wait-State Retention Scenario for Partial Input and a Control Wake (`UC-DD-02`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant TM as Timer Master (RT)
+    participant CAM as cam_100ms (Source)
+    participant LIDAR as lidar_100ms (incomplete)
+    participant SHM as /timpani_ttsched SHM
+    participant FUSION as fusion_all (ALL)
+    participant PLAN as plan_all (ALL)
+
+    TM->>CAM: L1 Source slot or L2 Source release
+    CAM->>SHM: signal_ready -> Successor ready_mask = 0b01
+    Note over LIDAR: no signal_ready from the other predecessor
+    Note over SHM,FUSION: ALL is not satisfied, so do not open the TT/CBS dispatch gate
+    CAM->>SHM: repeated signal from the same predecessor -> ready_mask remains 0b01
+    Note over SHM,FUSION: a control wake does not change the ready/dispatch sequence
+    Note over FUSION,PLAN: ALL is not satisfied -> execution count remains 0 regardless of class
+```
+
+---
+
+## 4. Differences Between the Current Code and the Phase 0 Design
+
+| Source to Inspect | Current-Code Observation and Difference Required by the Phase 0 Design |
+|:---|:---|
+| `timpani-o/src/global_scheduler.{h,cpp}` | A common candidate-validation/placement path is needed that separately generates the DAG and the Task's existing TT/CBS classification. |
+| `timpani-n/src/main.cpp` | Layer-specific entry registration and linkage to the common Pipeline DAG metadata are needed. |
+| `timpani-n/src/timer_master.{h,cpp}` | Connect L1 Task ready to the dispatch sequence in an allowed TT slot. |
+| `sample-apps/src/libttsched.{h,c}` | Add the common ready/dispatch sequences and `wait_data`/`signal_ready` *(subject to approval)*. |
+| `timpani-n/src/bpf/timpani.bpf.c` | Use the existing TT/CBS dispatch rules and allow only dispatches created by the L1/L2 adapters. |
+
+The table above is the starting point for the design and does not signify actual code changes or completed approval.
+
+---
+
+## 5. SRS Traceability Matrix
+
+| HLD Area | Active SRS Requirements | Verification Scenarios |
+|:---|:---|:---|
+| **H-DD-P0-01** | `REQ-DD-P0-F-001`, `REQ-DD-P0-F-002`, `REQ-DD-P0-N-003` | `TC-DD-P0-001`, `TC-DD-P0-003`, `TC-DD-P0-005`, `TC-DD-P0-006` |
+| **H-DD-P0-02** | `REQ-DD-P0-F-003`, `REQ-DD-P0-F-004`, `REQ-DD-P0-F-006`, `REQ-DD-P0-N-004` | `TC-DD-P0-003`, `TC-DD-P0-004`, `TC-DD-P0-005` |
+| **H-DD-P0-03** | `REQ-DD-P0-F-005`, `REQ-DD-P0-F-006`, `REQ-DD-P0-N-001`, `REQ-DD-P0-N-002` | `TC-DD-P0-001`, `TC-DD-P0-002`, `TC-DD-P0-004`, `TC-DD-P0-006` |
+| **H-DD-P0-04** | `REQ-DD-P0-F-004`..`F-008`, `REQ-DD-P0-N-002` | `TC-DD-P0-001`, `TC-DD-P0-002`, `TC-DD-P0-004` |
