@@ -1,0 +1,222 @@
+<!doctype html>
+<!--
+SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+SPDX-License-Identifier: MIT
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Radar–FCW 이벤트 흐름 — P1 계약 보강안</title>
+  <style>
+    :root { color-scheme: light; --bg:#f4f7fb; --surface:#fff; --ink:#172b43; --muted:#52647a; --line:#d6e0eb; --blue:#2459ce; --teal:#08776c; --red:#b33438; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.75 "Malgun Gothic","Apple SD Gothic Neo",sans-serif; }
+    main { max-width:1180px; margin:auto; padding:36px 22px 64px; }
+    header { margin-bottom:28px; }
+    h1 { font-size:30px; line-height:1.4; margin:8px 0 14px; }
+    h2 { font-size:22px; margin:0 0 12px; }
+    h3 { font-size:17px; margin:22px 0 8px; }
+    p { margin:8px 0; }
+    .eyebrow { color:var(--teal); font-weight:bold; letter-spacing:.04em; }
+    .badge { display:inline-block; padding:3px 11px; border-radius:20px; color:#154496; background:#e9f0ff; font-size:13px; }
+    section { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:24px; margin-top:22px; }
+    .note { border-left:4px solid var(--blue); background:#eef4ff; padding:12px 16px; margin:14px 0; }
+    .warning { border-left-color:var(--red); background:#fff1f0; }
+    .muted, figcaption { color:var(--muted); }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; }
+    .card { padding:15px; background:#f4f8fc; border:1px solid var(--line); border-radius:9px; }
+    .card strong { display:block; margin-bottom:5px; }
+    figure { margin:16px 0 0; }
+    .canvas, .table-wrap { overflow-x:auto; }
+    svg { display:block; width:100%; min-width:990px; height:auto; }
+    svg text { fill:var(--ink); font-family:"Malgun Gothic",sans-serif; font-size:14px; }
+    svg .small { font-size:12px; fill:var(--muted); }
+    svg .bold { font-weight:bold; }
+    svg .axis { stroke:#9aadc2; stroke-width:1.5; }
+    svg .arrow { stroke:var(--blue); stroke-width:2; fill:none; }
+    svg .edge { stroke:#8399b2; stroke-width:1.5; stroke-dasharray:5 4; }
+    svg .deadline { stroke:var(--red); stroke-width:2; stroke-dasharray:6 4; }
+    svg .box { fill:#edf3ff; stroke:var(--blue); stroke-width:1.5; }
+    svg .run { fill:#dcf2eb; stroke:var(--teal); stroke-width:1.5; }
+    svg .wait { fill:#f0f3f7; stroke:#8399b2; stroke-width:1.3; }
+    svg .fault { fill:#fff0ee; stroke:var(--red); stroke-width:1.5; }
+    svg .red { fill:var(--red); font-weight:bold; }
+    figcaption { font-size:13px; margin:8px 0; }
+    table { width:100%; min-width:760px; border-collapse:collapse; font-size:14px; }
+    th,td { padding:11px 13px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); }
+    th { background:#f1f5fa; }
+    code { background:#eaf0f6; padding:2px 5px; border-radius:4px; }
+    a { color:var(--blue); }
+    @media print { body { background:#fff; } main { max-width:none; padding:0; } section { break-inside:avoid; } .canvas svg { min-width:0; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">TIMPANI · Event-Driven Workload Support</div>
+    <h1>Radar–FCW 이벤트 흐름<br>P1: 한 Event–한 Job · 도달 기준 마감 감지</h1>
+    <span class="badge">2026-11-11 합의한 수정 방향 / 구현 전</span>
+    <p>레이더 경보를 인지한 시각부터 FCW(Forward Collision Warning — 전방 충돌 경고) 판단이 끝날 때까지를 추적합니다. 앱은 이벤트와 작업의 연결을 명시하고, TIMPANI는 CPU 예산과 실행 상태를 관리하며 마감 경과를 감지합니다.</p>
+    <div class="note warning"><b>문서 상태:</b> 기존 설계의 활성화 기준 근사와 배치 소비를 변경하는 <b>P1(Phase 1 — 1차 구현) 목표</b>입니다. 정본 설계 전체에 반영되거나 구현된 기능이 아닙니다. 아래 전달·감시 블록은 필요한 책임을 나타내며, 특정 공개 API나 타이머 구현을 확정하지 않습니다.</div>
+  </header>
+
+  <section>
+    <h2>1. 이번 수정의 세 가지 원칙</h2>
+    <div class="cards">
+      <div class="card"><strong>한 Event–한 Job</strong>수락한 경보마다 독립된 작업을 만듭니다. 처리 중 도착한 다음 경보는 다음 작업으로 남깁니다.</div>
+      <div class="card"><strong>마감은 도달 시각 + D</strong>워커가 늦게 깨어나거나 예산 보충을 기다려도 마감이 뒤로 이동하지 않습니다.</div>
+      <div class="card"><strong>끝나기를 기다리지 않고 감지</strong>작업이 대기·실행·실행 보류 중이어도 마감이 지나면 허용 감지 지연 안에 실패를 기록합니다.</div>
+    </div>
+    <p><b>Event(이벤트)</b>는 수신 경보 한 건, <b>Job(작업)</b>은 그 경보를 처리하는 한 단위입니다. 이벤트 데이터·식별자·도달 시각·작업 연결은 통지와 재시작 과정에서도 어긋나지 않아야 합니다.</p>
+  </section>
+
+  <section>
+    <h2>2. 전송과 처리의 역할을 분리한다</h2>
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 1080 330" role="img" aria-label="레이더 전송에서 수신 콜백을 거쳐 경보별 작업을 만들고 FCW 워커에 전달한다. TIMPANI는 이벤트와 작업 식별을 바탕으로 예산 집행 및 마감 감시를 수행한다.">
+          <defs><marker id="flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2459ce"/></marker></defs>
+          <rect class="wait" x="15" y="60" width="155" height="80" rx="8"/>
+          <text class="bold" x="92" y="91" text-anchor="middle">레이더 생산자</text>
+          <text class="small" x="92" y="116" text-anchor="middle">경보 송신</text>
+          <path class="arrow" d="M170 100H210" marker-end="url(#flow)"/>
+          <rect class="wait" x="212" y="60" width="175" height="80" rx="8"/>
+          <text class="bold" x="300" y="91" text-anchor="middle">전송·수신 경로</text>
+          <text class="small" x="300" y="116" text-anchor="middle">SOME/IP·수신 스레드</text>
+          <path class="arrow" d="M387 100H427" marker-end="url(#flow)"/>
+          <rect class="box" x="429" y="50" width="230" height="100" rx="8"/>
+          <text class="bold" x="544" y="79" text-anchor="middle">앱 입력 어댑터</text>
+          <text x="544" y="105" text-anchor="middle">경보 식별·도달 시각 기록</text>
+          <text class="small" x="544" y="130" text-anchor="middle">데이터 + 식별자 + t0 게시·통지</text>
+          <path class="arrow" d="M659 100H699" marker-end="url(#flow)"/>
+          <rect class="box" x="701" y="50" width="165" height="100" rx="8"/>
+          <text class="bold" x="783" y="79" text-anchor="middle">공통 연결 계약</text>
+          <text x="783" y="105" text-anchor="middle">수락·대기열 관리</text>
+          <text class="small" x="783" y="130" text-anchor="middle">Event → Job → 워커</text>
+          <path class="arrow" d="M866 100H906" marker-end="url(#flow)"/>
+          <rect class="run" x="908" y="50" width="155" height="100" rx="8"/>
+          <text class="bold" x="985" y="79" text-anchor="middle">FCW 워커</text>
+          <text x="985" y="105" text-anchor="middle">한 건 처리·결과 게시</text>
+          <text class="small" x="985" y="130" text-anchor="middle">작업 시작·완료 명시</text>
+          <path class="arrow" d="M783 150V207" marker-end="url(#flow)"/>
+          <path class="arrow" d="M985 150V185H940V207" marker-end="url(#flow)"/>
+          <rect class="box" x="429" y="210" width="634" height="92" rx="8"/>
+          <text class="bold" x="746" y="238" text-anchor="middle">TIMPANI: 식별·시각 연결 / 예산 집행 / 기한 감시</text>
+          <text x="746" y="264" text-anchor="middle">커널 실행시간 관측 + 앱의 명시적 Event·Job 정보</text>
+          <text class="small" x="746" y="287" text-anchor="middle">대기 중 기한도 감시 · 등록 세대 구분 · 마감 실패 중복 방지</text>
+        </svg>
+      </div>
+      <figcaption>입력 프로토콜의 해석은 앱에 둡니다. UDP(User Datagram Protocol — 데이터그램 전송 프로토콜) 등으로 입력을 바꿔도 동일한 연결 계약을 사용합니다. 그림은 실제 라이브러리·프로세스 분할을 확정하지 않습니다.</figcaption>
+    </figure>
+    <p>t0는 <b>이 예제의 수신 콜백에서 유효한 경보로 식별한 시각</b>입니다. 그 이전의 전송·수신 스레드 대기는 이 응답시간에 포함되지 않습니다. IRQ(Interrupt Request — 인터럽트 요청) 처리나 미들웨어 내부 스레드가 FCW 워커의 예산에 자동 포함되는 것은 아닙니다.</p>
+  </section>
+
+  <section>
+    <h2>3. 정상 처리: 마감은 하나, t0 + D</h2>
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 1080 355" role="img" aria-label="t0 도달 후 수락과 활성화를 거쳐 t1에 처리 시작, t2에 완료한다. 유일한 마감은 t0+D이며 활성화 지연만큼 연장하지 않는다.">
+          <line class="axis" x1="145" y1="265" x2="1040" y2="265"/>
+          <text class="bold" x="15" y="99">입력 어댑터</text>
+          <text class="bold" x="15" y="181">FCW 워커</text>
+          <line class="edge" x1="210" y1="45" x2="210" y2="265"/>
+          <text class="bold" x="210" y="29" text-anchor="middle">t0 · 도달</text>
+          <rect class="box" x="210" y="75" width="135" height="42" rx="6"/>
+          <text x="277" y="101" text-anchor="middle">게시·통지·수락</text>
+          <line class="edge" x1="345" y1="120" x2="345" y2="265"/>
+          <text class="small" x="345" y="143" text-anchor="middle">ta · 활성화</text>
+          <rect class="wait" x="345" y="157" width="155" height="43" rx="6"/>
+          <text x="422" y="183" text-anchor="middle">실행 가능·CPU 대기</text>
+          <rect class="run" x="500" y="157" width="205" height="43" rx="6"/>
+          <text x="602" y="183" text-anchor="middle">경보 한 건 처리·결과 게시</text>
+          <line class="edge" x1="500" y1="145" x2="500" y2="265"/>
+          <line class="edge" x1="705" y1="145" x2="705" y2="265"/>
+          <line class="deadline" x1="890" y1="45" x2="890" y2="265"/>
+          <text class="red" x="890" y="29" text-anchor="middle">절대 마감 = t0 + D</text>
+          <path class="arrow" d="M210 230H705"/>
+          <text class="bold" x="457" y="221" text-anchor="middle">응답시간 R = t2 − t0</text>
+          <text x="210" y="290" text-anchor="middle">Arrival</text>
+          <text x="345" y="290" text-anchor="middle">Activation</text>
+          <text x="500" y="290" text-anchor="middle">t1 · 처리 시작</text>
+          <text x="705" y="290" text-anchor="middle">t2 · 완료</text>
+          <text class="red" x="890" y="290" text-anchor="middle">D는 여기까지 허용</text>
+          <text class="small" x="145" y="330">개념도·축척 아님. 커널의 최초 실행 시각과 앱의 Job 처리 시작 시각은 구분하여 연결한다.</text>
+        </svg>
+      </div>
+      <figcaption>대기하던 워커가 깨어나는 정상 사례입니다. Activation은 새 작업이 실행 가능해지는 사건이지 마감의 시작점을 바꾸는 사건이 아닙니다. t1은 이 그림에서 앱이 명시하는 작업 처리 시작이며, 커널의 최초 실행 기록과 자동으로 동일시하지 않습니다.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <thead><tr><th>용어</th><th>의미</th><th>측정·계약</th></tr></thead>
+      <tbody>
+        <tr><td>R — Response time<br>응답시간</td><td>t2 − t0. CPU 대기·선점·예산 보충 대기를 포함</td><td>해당 Event의 고정된 도달 시각과 Job 완료를 연결</td></tr>
+        <tr><td>D — Relative deadline<br>상대 마감시간</td><td>도달 후 완료까지 허용되는 시간</td><td>t2 ≤ t0 + D이면 충족. 활성화·수락 지연만큼 연장하지 않음</td></tr>
+        <tr><td>C — CPU 실행시간 예산</td><td>선언의 runtime에 대응. R과 다름</td><td>실제 CPU 실행 구간을 합산·차감. 예산 소진 시 실행 보류</td></tr>
+        <tr><td>MIT — Minimum Inter-arrival Time<br>최소 도달 간격</td><td>같은 발생원의 연속 Event 간격 하한</td><td>Event별 도달 시각 차이로 검사. 위반해도 마감 기준을 재설정하지 않음</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>4. 마감 실패: 완료되지 않아도 감지한다</h2>
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 1080 290" role="img" aria-label="작업이 실행 보류 중이어도 t0+D가 경과하면 감지 경로가 허용 지연 안에 마감 실패를 기록한다. 늦은 완료는 같은 작업에 연결하고 실패를 중복 계수하지 않는다.">
+          <text class="bold" x="15" y="104">FCW 작업</text>
+          <text class="bold" x="15" y="191">기한 감시</text>
+          <line class="axis" x1="150" y1="230" x2="1040" y2="230"/>
+          <rect class="wait" x="180" y="78" width="140" height="42" rx="6"/>
+          <text x="250" y="104" text-anchor="middle">실행 대기</text>
+          <rect class="run" x="320" y="78" width="120" height="42" rx="6"/>
+          <text x="380" y="104" text-anchor="middle">CPU 실행</text>
+          <rect class="wait" x="440" y="78" width="340" height="42" rx="6"/>
+          <text x="610" y="104" text-anchor="middle">예산 소진·실행 보류 / 또는 계속 대기</text>
+          <rect class="run" x="780" y="78" width="170" height="42" rx="6"/>
+          <text x="865" y="104" text-anchor="middle">재개 → 늦은 완료</text>
+          <line class="deadline" x1="650" y1="40" x2="650" y2="230"/>
+          <text class="red" x="650" y="27" text-anchor="middle">t0 + D · 마감</text>
+          <path class="arrow" d="M180 175H650"/>
+          <text class="small" x="380" y="166" text-anchor="middle">수락 시부터 도달 기준 기한을 감시</text>
+          <rect class="fault" x="680" y="150" width="230" height="62" rx="6"/>
+          <text class="red" x="795" y="175" text-anchor="middle">미완료 확인 → 마감 실패 감지</text>
+          <text class="small" x="795" y="197" text-anchor="middle">완료·실행 재개를 기다리지 않음</text>
+          <text x="180" y="253" text-anchor="middle">t0 · 도달</text>
+          <text class="small" x="650" y="253" text-anchor="middle">감지 지연 상한: 후속 결정·검증</text>
+          <text x="950" y="253" text-anchor="middle">t2 · 완료</text>
+        </svg>
+      </div>
+      <figcaption>DMISS(Deadline Miss — 마감 실패)는 작업당 한 번 식별합니다. 그림의 감시 블록은 개념적 책임이며 타이머·실행 스레드·커널 전달 수단은 미확정입니다. 감지 지연과 외부 보고 지연은 별도로 제한해야 합니다.</figcaption>
+    </figure>
+    <div class="note"><b>경합 처리:</b> 마감과 같은 시각까지 완료된 Job은 성공입니다. 완료 기록 수집이 늦었다는 이유만으로 실패로 판정하지 않습니다. 완료와 타이머가 경합해도 실제 완료 시각으로 판정하고 중복 계수를 막아야 합니다. 마감 실패는 자동 취소를 뜻하지 않으며 계속 실행·취소 정책은 별도입니다.</div>
+  </section>
+
+  <section>
+    <h2>5. 처리 중 다음 경보가 와도 작업을 합치지 않는다</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>순서</th><th>상황</th><th>유지할 연결</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>경보 A 수락 → Job A 처리 시작</td><td>A 식별자·A 도달 시각·A 마감 고정</td></tr>
+        <tr><td>2</td><td>A 처리 중 경보 B 도달·수락</td><td>B를 별도 대기 항목으로 보존하고 B의 기한도 감시. A 시각을 덮어쓰지 않음</td></tr>
+        <tr><td>3</td><td>A 완료 → 수면 없이 B 처리 시작</td><td>A 완료와 Job B 시작을 명시. 새로운 커널 깨움이 없어도 서로 다른 Job</td></tr>
+        <tr><td>4</td><td>B 완료 또는 B 마감 경과</td><td>B 도달 기준으로 독립 판정. Job 시작·예산 보충으로 B의 마감을 늦추지 않음</td></tr>
+      </tbody>
+    </table></div>
+    <p><b>새 Job ≠ 새 CPU 예산.</b> CBS(Constant Bandwidth Server — CPU 사용량을 예산과 보충 규칙으로 제한하는 서버)의 잔여 예산과 보충 규칙은 별도로 적용합니다. Job 도중의 블로킹은 첫 구현에서 피하고, 로그 등 잠들 수 있는 작업은 다른 스레드로 넘깁니다.</p>
+  </section>
+
+  <section>
+    <h2>6. 구현 전에 정할 사항과 검증 경계</h2>
+    <ul>
+      <li><b>수락·게시:</b> 데이터와 이벤트 정보가 함께 사용 가능해지는 경계를 정의합니다. 통지 거절·대기열 넘침은 완료가 아닌 거절·폐기로 기록합니다.</li>
+      <li><b>복구:</b> 재시작 시 데이터와 시각이 어긋나지 않도록 동기화하고, 이전 등록의 타이머·완료·종료 정보가 새 등록을 변경하지 않도록 세대를 구분합니다.</li>
+      <li><b>기한 감시:</b> 미완료 감지 지연 상한, 통지 전 수락 지연의 처리, 타이머와 완료의 경합 규약을 확정합니다. 감지 지연 0을 가정하지 않습니다.</li>
+      <li><b>예산·승인:</b> 틱 단위 초과 실행과 스케줄링 비용을 다른 앱의 간섭 계산에 반영하고, 필수 통계를 상세 추적의 활성 여부와 분리합니다.</li>
+      <li><b>지원 수준:</b> 등록 워커의 실행만 관측하는 경로를 Event별 도달 기준 마감 지원과 동일하게 설명하지 않습니다.</li>
+      <li><b>두 앱 검증:</b> SOME/IP FCW와 비-SOME/IP 센서 앱을 같은 계약으로 연결하고, 정상·버스트·과실행·동시 실행·재시작을 검증합니다.</li>
+    </ul>
+    <p class="muted">FCW 기존 C=2ms, D=5ms, MIT=18ms는 검증 완료 값이 아닙니다. 타깃의 실제 처리시간·전달 지터·다른 태스크의 간섭으로 확정합니다. t0 이전 유실·지연과 실제 결과 전달까지의 전체 경로 보장은 별도 설계 대상입니다.</p>
+    <p><a href="doc/design/kor/P1-008-event-job-contract-amendment.md">P1 계약 보강 합의</a> · <a href="doc/design/kor/OVERVIEW-008-event-driven-workload-support.md">설계 개요와 기존 기준 설명</a> · <a href="https://github.com/eclipse-timpani/timpani26/issues/53">기능 지원 Issue #53</a></p>
+  </section>
+</main>
+</body>
+</html>
