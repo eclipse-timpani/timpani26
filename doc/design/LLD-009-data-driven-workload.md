@@ -514,7 +514,7 @@ A successful `signal_ready` means that the complete outgoing-edge list passed pr
 
 Check the following on the non-RT path before applying the table. If a check fails, reject the candidate without changing the active state.
 - Name/hash of the common DAG metadata, predecessor references, edge/capacity limits, and complete per-Source outgoing-edge uniqueness/range
-- Every outgoing edge's destination, predecessor bit membership in `required_mask`, trigger mode, and TT/CBS model before publishing any edge plan
+- Every outgoing edge's destination, predecessor-bit assignment, trigger mode, and TT/CBS model. For every destination, the incoming-bit OR-union SHALL equal `required_mask`, every bit SHALL have exactly one incoming edge, and no duplicate incoming bit assignment SHALL remain before publishing any edge plan
 - Whether the execution layer in each Task's common metadata corresponds to exactly one TT entry or CBS entry
 - Representation ranges for the TT entry's CPU/slot/timing and the CBS entry's CPU/budget/period/deadline
 - Verify that the Source/Successor role and execution layer are independent and that the class has not been forcibly changed
@@ -524,7 +524,49 @@ Check the following on the non-RT path before applying the table. If a check fai
 
 1. The SHM publisher uses each TT/CBS entry's `(workload_id_hash, task_id_hash)` pair as the canonical key for the common `pipeline[]` index. Retain the Phase 0 unique-Task-name constraint for compatibility with SHM name lookup.
 2. Initialize each pipeline slot's `workload_id_hash`, `task_id_hash`, `execution_model`, `required_mask`, and `out_edges`, and set `ready_state=0` and `dispatch_counter=0`.
-3. Traverse predecessor keys in the common DAG metadata to populate `required_mask` and `out_edges`; each Source SHALL have at most one edge to a destination and each edge bit SHALL exist in that destination's required mask. Reject the candidate before publication if that invariant is not met.
+3. Build and validate a destination-indexed incoming-bit map before publication:
+   - Traverse the common DAG metadata's predecessor keys and assign each Successor's direct predecessors to distinct bit positions `0..15`. Populate `required_mask` from the assignment and create one corresponding `out_edge` from each predecessor.
+   - Initialize fixed arrays `incoming_masks[TIMPANI_MAX_TASKS]` and `incoming_edges[TIMPANI_MAX_TASKS]` to zero. During the complete outgoing-edge traversal, validate `dst_slot_idx < n_tasks`, `bit_idx < 16`, destination `required_mask` membership, and one edge per Source/destination pair. If `incoming_masks[dst]` already contains the bit, reject the candidate as a duplicate incoming-bit assignment; otherwise set it and increment `incoming_edges[dst]`.
+   - After traversing every active Source, require `incoming_masks[i] == required_mask[i]` and `incoming_edges[i] == popcount(required_mask[i])` for every active Pipeline slot. Thus `ALL` has exactly one incoming edge for every required bit and no required bit that lacks an edge. A bit alias, an extra required bit, or an extra edge bit is rejected before publication. A Task with `required_mask == 0` SHALL have `incoming_edges == 0`.
+
+   ```c
+   uint32_t incoming_masks[TIMPANI_MAX_TASKS] = {};
+   uint16_t incoming_edges[TIMPANI_MAX_TASKS] = {};
+
+   if (n_tasks > TIMPANI_MAX_TASKS)
+       return EINVAL;
+   for (uint16_t src = 0; src < n_tasks; src++) {
+       uint16_t n_edges = pipeline[src].num_out_edges;
+       if (n_edges > TIMPANI_MAX_OUT_EDGES)
+           return EINVAL;
+       for (uint16_t edge = 0; edge < n_edges; edge++) {
+           uint16_t dst = pipeline[src].out_edges[edge].dst_slot_idx;
+           uint16_t bit_idx = pipeline[src].out_edges[edge].bit_idx;
+
+           if (dst >= n_tasks || bit_idx >= 16)
+               return EINVAL;
+           for (uint16_t prior = 0; prior < edge; prior++) {
+               if (pipeline[src].out_edges[prior].dst_slot_idx == dst)
+                   return EINVAL;
+           }
+           uint32_t bit = 1U << bit_idx;
+           if ((pipeline[dst].required_mask & bit) == 0U ||
+               (incoming_masks[dst] & bit) != 0U)
+               return EINVAL;
+           incoming_masks[dst] |= bit;
+           incoming_edges[dst]++;
+       }
+   }
+
+   for (uint16_t dst = 0; dst < n_tasks; dst++) {
+       uint32_t required = pipeline[dst].required_mask;
+       if (incoming_masks[dst] != required ||
+           incoming_edges[dst] != __builtin_popcount(required))
+           return EINVAL;
+   }
+   ```
+
+   This full-table check is an N-side publication precondition. The RT `signal_ready()` per-Source plan cannot establish global bijection by itself and therefore relies on this validated immutable metadata for the life of the publication generation.
 4. Register TT Tasks with the existing `TtSlot`/TimerMaster and CBS Tasks with the existing `CbsConfig`/CbsState.
 5. Immediately before publication, set writer-pending in `pipeline_header.publication_guard` to prevent new Pipeline commits. Existing active commits must finish first; the publisher waits for the active count to reach `0` through bounded `FUTEX_WAIT` or bounded yield. When the last reader exits, it detects writer-pending and wakes the guard futex.
 6. After the active count reaches `0`, publish in the order `magic=0`, odd `generation`, `tasks[]`/`pipeline_header`/`pipeline[]` updates, valid `pipeline_header.magic/version/abi_size`, even `generation`, valid base `magic`, and writer-pending release.
@@ -567,8 +609,8 @@ If ready arrives after an L1 slot, Phase 0 retains it as pending until the next 
    - Preserve node-wide uniqueness and the `1..15`-byte ASCII length limit for the Task name because Phase 0 retains the existing SHM name lookup. Reject duplicate normalized Task keys, self-reference, nonexistent references, and collisions in the `(fnv1a(workload_id), fnv1a(task_id))` hash pair.
    - Enforce a maximum of `16` immediate predecessors and `8` outgoing edges per vertex. After Kahn's Algorithm over a lexicographically ordered ready queue, `out_topo_rank.size() != task_index.size()` indicates a cycle and shall be rejected.
 3. **Class-independent table construction (`build_table`)**:
-   - `PipelineTaskConfig` carries no execution-layer field. It contains `PipelineTaskKey(workload_id_hash, task_id_hash)` and predecessor key values. Create TT/CBS entries separately according to the resolved class.
-   - Create a `TtSlot` from the input timing for an L1 Task and a `CbsConfig` from the input timing for an L2 Task. Source/Successor does not determine this branch.
+   - `PipelineTaskConfig` carries no execution-layer field. It contains `PipelineTaskKey(workload_id_hash, task_id_hash)` and predecessor key values. Sort each Successor's normalized predecessor keys deterministically and assign them distinct bit positions in ascending order. With `n` predecessors, the generated `required_mask` is exactly `(1U << n) - 1U`; `n == 0` produces `0`. Create TT/CBS entries separately according to the resolved class.
+   - Create a `TtSlot` from the input timing for an L1 Task and a `CbsConfig` from the input timing for an L2 Task. Source/Successor does not determine this branch. Emit one outgoing edge for each assigned predecessor/destination pair and run the same incoming-mask equality check required in §4.2 before returning the candidate.
    - O uses the DAG topological order only as a tie-breaker for TT slot collision checks or CBS admission checks.
 4. **Phase 0 placement and deferral**:
    - Support explicit/inherited class mixtures within the same workload, using existing TT placement and existing CBS admission/worst-fit.
@@ -632,7 +674,8 @@ Unit tests shall verify that the DAG is processed without inferring an execution
 | Class resolution | An explicit Task class takes precedence over the workload default, an omitted Task class inherits the default, and `predecessors` do not affect the class |
 | Reference normalization/rejection | An empty `workload_id` resolves to the current workload; Phase 0 cross-workload references, duplicate keys, hash-pair collisions, and nonexistent references are rejected before activation |
 | O DAG/placement | Normalized keys, topological order, and TT/CBS placement are input-order independent, and the execution class equals the explicit/inherited value |
-| N registration | The `(workload_id_hash, task_id_hash)` pair connects to exactly one TT/CBS entry and the class is unchanged |
+| N registration | The `(workload_id_hash, task_id_hash)` pair connects to exactly one TT/CBS entry and the class is unchanged. For every active slot, no two incoming edges share a bit, the incoming-bit OR-union equals `required_mask`, and `incoming_edge_count == popcount(required_mask)`. |
+| Incoming-bit bijection | Accept a two-predecessor Successor represented as bits `0` and `1` with `required_mask=0b11`. Separately reject two incoming edges both assigned bit `0`, a mask containing `0b100` with no third edge, and an edge bit outside the mask. Rejection preserves the committed candidate/active SHM state. |
 | SHM ABI | On a legacy 784-byte object, only the TT API works and Pipeline APIs return `ENOTSUP`; magic/ABI-size mismatch returns `EINVAL`, a valid-magic unsupported version returns `ENOTSUP`, and no out-of-range access occurs |
 | Mapping revalidation | A prefix-only client mapping returns `ENOTSUP` without extension access. Separately, truncate a previously full mapped object below the ABI size or unlink/recreate the name, then call `signal_ready`/`wait_data`; both return `ESTALE` before any `pipeline_header`/`pipeline[]` dereference and neither mutates shared state nor causes `SIGBUS`. A successful replacement requires caller reinitialization. |
 | Permissions | O_RDWR failure for a Pipeline writer returns `EACCES`; a read-only Successor may call `wait_data`, while `signal_ready` returns `EACCES` |

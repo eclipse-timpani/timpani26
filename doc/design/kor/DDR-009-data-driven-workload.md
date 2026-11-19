@@ -63,8 +63,9 @@ flowchart LR
 ## 3. D-DD-P0-02 (결정 9B) — `ready_state` 선행 비트 + ready sequence의 단일 CAS 갱신
 
 - **결정**:
-  - 후행 Task마다 직속 선행별 비트를 배정한다. `signal_ready(job_token)`는 `job_token == ready_sequence`이고 해당 선행 비트가 미설정일 때만 destination을 변경한다. token이 활성인 동안 같은 선행 비트가 중복되면 `EALREADY`, sequence 증가 후 재시도한 token을 포함한 낡은/미래 token은 `ESTALE`이며 둘 다 상태를 바꾸지 않는다.
-  - Source는 첫 destination CAS 전에 전체 outgoing-edge plan을 검증·preflight한다. edge 수, index, self/중복 destination, required-bit 소속, trigger mode, execution model, 각 destination의 token/중복 상태를 확인하며 plan 실패는 전체 fan-out에 mutation이 없다. CAS 재시도 중 동시 동일 호출이 bit/sequence를 먼저 완료하면 늦은 실패가 아니라 수렴 완료로 본다.
+  - Successor의 각 직속 선행에는 서로 다른 bit를 정확히 하나씩 배정한다. 전체 incoming-edge OR-union은 해당 Successor의 `required_mask`와 같고 incoming-edge 수는 `popcount(required_mask)`이며 zero mask에는 incoming edge가 없다. O는 이 인코딩을 결정적으로 생성하고 N은 bit alias, 누락 required bit, 여분 incoming bit가 있으면 게시 전에 거절한다.
+  - `signal_ready(job_token)`는 `job_token == ready_sequence`이고 해당 선행 비트가 미설정일 때만 destination을 변경한다. token이 활성인 동안 같은 선행 비트가 중복되면 `EALREADY`, sequence 증가 후 재시도한 token을 포함한 낡은/미래 token은 `ESTALE`이며 둘 다 상태를 바꾸지 않는다.
+  - Source는 첫 destination CAS 전에 전체 outgoing-edge plan을 검증·preflight한다. edge 수, index, self/중복 destination, required-bit 소속, trigger mode, execution model, 각 destination의 token/중복 상태를 확인하며 plan 실패는 전체 fan-out에 mutation이 없다. 한 Source만으로는 다른 선행까지 포함한 global union을 증명할 수 없으므로 runtime preflight는 게시 시 global bijection 검사를 신뢰한다. CAS 재시도 중 동시 동일 호출이 bit/sequence를 먼저 완료하면 늦은 실패가 아니라 수렴 완료로 본다.
   - `ALL` CAS는 `ready_state`의 ready mask를 0으로 만들고 활성 token/ready sequence를 1 증가시키는 단일 lock-free 64비트 CAS다. CAS 실패 때마다 token과 bit 검사를 반복한다. 모든 outgoing-edge CAS가 끝난 뒤 CBS `dispatch_counter` 갱신/futex wake를 수행하며 이 연산들은 publication guard 안에서 게시 세대 전환과 직렬화한다.
   - `wait_data()`는 `dispatch_counter - 1` token을 반환하고 소비자는 그 token-addressed payload를 읽은 뒤 같은 token을 전달할 수 있다. CBS adapter는 같은 guard 안에서 `dispatch_counter`를 증가시키고, TT adapter는 Timer Master가 허용 slot에서 pending ready가 있을 때만 증가시킨다. 같은 token을 두 번 dispatch하지 않는다.
 - **이유**:
@@ -73,7 +74,7 @@ flowchart LR
   - 세대 확인 후 CAS만으로는 게시-소비 TOCTOU를 막지 못하므로 guard로 전체 commit을 직렬화한다.
   - edge를 검증하자마자 변경하면 뒤쪽 edge 오류 시 앞쪽 Successor에 부분 알림이 남는다. 전체 plan 사전검증과 wake 지연은 이 관측 가능한 부분 fan-out을 막고 edge별 CAS가 동시 선행 갱신은 계속 처리하게 한다.
   - Phase 1/2 Window·SKIP 상태 기계는 미리 구현하지 않는다.
-- **비채택**: edge별 검증과 변경을 한 번에 하는 방식, token 없는 선행 비트 OR, 단순 잔여 카운터 감소, Phase 0에서의 `Timer Master` 주기 경계 상태 리셋 개입.
+- **비채택**: edge별 검증과 변경을 한 번에 하는 방식, token 없는 선행 비트 OR, incoming 선행 간 bit alias, 대응 edge 없는 required-mask bit, 단순 잔여 카운터 감소, Phase 0에서의 `Timer Master` 주기 경계 상태 리셋 개입.
 - **추적**: `REQ-DD-P0-F-005`, `REQ-DD-P0-N-001`.
 
 ---

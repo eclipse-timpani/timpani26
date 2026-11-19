@@ -102,7 +102,7 @@ stateDiagram-v2
     RUNNING --> WAITING_DATA: token k 처리 후 같은 token 전달
 ```
 
-- packed `ready_state`의 `ALL` CAS부터 계층별 `dispatch_counter` 갱신과 futex wake까지는 게시 commit guard 안에서 수행한다. 상태를 바꾸기 전에 `signal_ready(k)`는 Source의 전체 outgoing-edge 목록을 검증·preflight하므로 잘못된 metadata 또는 중복/낡은 destination 하나가 있으면 전체 fan-out이 불변이다. 같은 `(predecessor, k)`가 preflight 시 이미 설정됐으면 `EALREADY`, 다른 token이면 `ESTALE`이다. CAS 중 동시 동일 commit이 bit/sequence를 앞서면 수렴으로 처리한다. 하나의 64비트 CAS가 destination mask reset과 ready sequence/job token 증가를 원자적으로 수행한다.
+- packed `ready_state`의 `ALL` CAS부터 계층별 `dispatch_counter` 갱신과 futex wake까지는 게시 commit guard 안에서 수행한다. 게시 시 각 Successor의 직속 incoming edge가 `required_mask`와 일대일임을 먼저 증명한다. 두 edge의 bit alias, 대응 edge 없는 required bit, mask 밖 edge bit를 거절한다. 상태 변경 전에 `signal_ready(k)`는 Source의 전체 outgoing-edge 목록을 검증·preflight하므로 잘못된 metadata 또는 중복/낡은 destination 하나가 있으면 전체 fan-out이 불변이다. 같은 `(predecessor, k)`가 preflight 시 이미 설정됐으면 `EALREADY`, 다른 token이면 `ESTALE`이다. CAS 중 동시 동일 commit이 bit/sequence를 앞서면 수렴으로 처리한다. 하나의 64비트 CAS가 destination mask reset과 ready sequence/job token 증가를 원자적으로 수행한다.
 - `ALL`은 ready sequence만 만든다. L1 Successor는 Timer Master가 자신의 TT slot에서 `pending`을 확인한 경우에만 `dispatch_counter`를 1 증가시키고, L2 Successor는 모든 outgoing-edge CAS가 완료된 `ALL` commit에서 1 증가시킨다. `dispatch_counter`만 futex word다.
 - L1 slot 시 ready가 없으면 wake `0`이다. slot을 지난 ready는 다음 TT slot까지 pending으로 유지하며, Phase 0 정상 시험은 pending 1개까지만 포함한다.
 - futex wake 후 Task가 Runnable이 되어야 기존 BPF 경로가 실행한다. L1은 TT slot에서, L2는 CBS budget/Gap에서 실제 CPU dispatch를 받는다.

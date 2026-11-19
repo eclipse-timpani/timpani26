@@ -514,7 +514,7 @@ out:
 
 테이블 적용 전에 비RT 경로에서 다음을 확인한다. 실패 시 활성 상태를 바꾸지 않고 거절한다.
 - 공통 DAG metadata의 이름/해시, 선행 참조, 간선·용량 상한, Source별 전체 outgoing-edge 유일성/범위
-- 모든 outgoing edge의 destination, `required_mask` 내 선행 bit 소속, trigger mode, TT/CBS model을 edge plan 게시 전에 확인
+- 모든 outgoing edge의 destination, predecessor bit assignment, trigger mode, TT/CBS model을 확인한다. 각 destination에서 incoming-bit OR-union은 `required_mask`와 같고 각 bit의 incoming edge는 정확히 하나이며 중복 incoming bit가 없어야 edge plan을 게시할 수 있다
 - 각 Task의 공통 metadata 실행 계층이 TT entry 또는 CBS entry 중 정확히 하나와 일치
 - TT entry의 CPU/slot/timing, CBS entry의 CPU/budget/period/deadline 표현 범위
 - Source/Successor 역할과 실행 계층은 서로 독립이며 클래스가 강제로 바뀌지 않았는지 확인
@@ -524,7 +524,49 @@ out:
 
 1. SHM 게시자는 TT/CBS entry의 `(workload_id_hash, task_id_hash)` 쌍을 정규 key로 사용해 공통 `pipeline[]` 인덱스를 만든다. Phase 0의 Task name 유일성 제약은 SHM name lookup 호환을 위해 유지한다.
 2. 각 pipeline slot의 `workload_id_hash`, `task_id_hash`, `execution_model`, `required_mask`, `out_edges`를 초기화하고 `ready_state=0`, `dispatch_counter=0`을 설정한다.
-3. 공통 DAG metadata의 predecessor key를 순회해 `required_mask`와 `out_edges`를 채운다. 각 Source의 한 destination edge는 최대 1개이고 edge bit가 destination required mask에 있어야 한다. 불만족 후보는 게시 전에 거절한다.
+3. 게시 전에 destination-indexed incoming-bit map을 생성·검증한다.
+   - 공통 DAG metadata의 predecessor key를 순회해 Successor의 직속 선행마다 서로 다른 bit position `0..15`를 배정한다. 이 배정으로 `required_mask`를 만들고 각 선행에 대응하는 `out_edge`를 하나 생성한다.
+   - 고정 배열 `incoming_masks[TIMPANI_MAX_TASKS]`와 `incoming_edges[TIMPANI_MAX_TASKS]`를 0으로 초기화한다. 전체 outgoing-edge 순회에서 `dst_slot_idx < n_tasks`, `bit_idx < 16`, destination `required_mask` 소속, Source/destination edge 1개를 확인한다. `incoming_masks[dst]`에 이미 같은 bit가 있으면 중복 incoming-bit assignment로 거절하고, 없으면 bit를 설정하고 `incoming_edges[dst]`를 증가시킨다.
+   - 모든 활성 Source 순회 후 각 활성 Pipeline slot에 대해 `incoming_masks[i] == required_mask[i]`와 `incoming_edges[i] == popcount(required_mask[i])`를 요구한다. 따라서 `ALL`의 모든 required bit에는 정확히 하나의 incoming edge가 존재하며 edge 없는 required bit는 없다. bit alias, 여분 required bit, required-mask 밖 edge bit는 게시 전에 거절한다. `required_mask == 0`인 Task는 `incoming_edges == 0`이어야 한다.
+
+   ```c
+   uint32_t incoming_masks[TIMPANI_MAX_TASKS] = {};
+   uint16_t incoming_edges[TIMPANI_MAX_TASKS] = {};
+
+   if (n_tasks > TIMPANI_MAX_TASKS)
+       return EINVAL;
+   for (uint16_t src = 0; src < n_tasks; src++) {
+       uint16_t n_edges = pipeline[src].num_out_edges;
+       if (n_edges > TIMPANI_MAX_OUT_EDGES)
+           return EINVAL;
+       for (uint16_t edge = 0; edge < n_edges; edge++) {
+           uint16_t dst = pipeline[src].out_edges[edge].dst_slot_idx;
+           uint16_t bit_idx = pipeline[src].out_edges[edge].bit_idx;
+
+           if (dst >= n_tasks || bit_idx >= 16)
+               return EINVAL;
+           for (uint16_t prior = 0; prior < edge; prior++) {
+               if (pipeline[src].out_edges[prior].dst_slot_idx == dst)
+                   return EINVAL;
+           }
+           uint32_t bit = 1U << bit_idx;
+           if ((pipeline[dst].required_mask & bit) == 0U ||
+               (incoming_masks[dst] & bit) != 0U)
+               return EINVAL;
+           incoming_masks[dst] |= bit;
+           incoming_edges[dst]++;
+       }
+   }
+
+   for (uint16_t dst = 0; dst < n_tasks; dst++) {
+       uint32_t required = pipeline[dst].required_mask;
+       if (incoming_masks[dst] != required ||
+           incoming_edges[dst] != __builtin_popcount(required))
+           return EINVAL;
+   }
+   ```
+
+   이 전체 테이블 검사는 N 게시 사전조건이다. RT `signal_ready()`의 Source-local plan만으로는 global bijection을 증명할 수 없으므로 게시 generation 수명 동안 검증된 불변 metadata를 사용한다.
 4. TT Task는 기존 `TtSlot`/TimerMaster에, CBS Task는 기존 `CbsConfig`/CbsState에 등록한다.
 5. 실제 게시 직전 `pipeline_header.publication_guard`에 writer-pending 비트를 설정해 새 Pipeline commit 진입을 차단한다. 이미 시작된 활성 commit은 게시의 상태 기록보다 먼저 끝나야 하며, publisher는 active count가 `0`이 될 때까지 제한된 시간 `FUTEX_WAIT` 또는 bounded yield로 대기한다. 마지막 reader는 guard를 해제할 때 writer-pending을 감지하면 guard futex wake를 수행한다.
 6. active count가 `0`이 된 뒤 `magic=0`, 홀수 `generation`, `tasks[]`/`pipeline_header`/`pipeline[]` 갱신, `pipeline_header.magic/version/abi_size` 유효화, 짝수 `generation`, `magic=유효`, writer-pending 해제 순서로 게시한다.
@@ -567,8 +609,8 @@ Phase 0 L1 slot에 ready가 늦게 도착하면 해당 slot에서는 wake하지 
    - Task name은 기존 SHM lookup 호환을 위해 노드 단위로 유일해야 하며 길이는 `1..15`바이트 ASCII다. 정규화 Task key 중복, 자기 참조, 미존재 참조, `(fnv1a(workload_id), fnv1a(task_id))` hash 쌍 충돌을 거절한다.
    - 직속 선행 최대 `16`개와 정점별 후행 간선 최대 `8`개를 확인한다. 사전순 ready queue 기반 Kahn's Algorithm 종료 후 `out_topo_rank.size() != task_index.size()`이면 순환 의존성으로 거절한다.
 3. **클래스 독립 테이블 생성 (`build_table`)**:
-   - `PipelineTaskConfig`는 실행 계층 필드를 갖지 않고 `PipelineTaskKey(workload_id_hash, task_id_hash)`와 선행 key 목록만 갖는다. TT/CBS entry는 resolved class에 따라 별도로 만든다.
-   - L1 Task는 입력 timing으로 `TtSlot`을, L2 Task는 입력 timing으로 `CbsConfig`를 만든다. Source/Successor는 이 분기를 결정하지 않는다.
+   - `PipelineTaskConfig`는 실행 계층 필드를 갖지 않고 `PipelineTaskKey(workload_id_hash, task_id_hash)`와 선행 key 목록만 갖는다. 각 Successor의 정규화 선행 key를 결정적으로 정렬하고 오름차순으로 서로 다른 bit position을 배정한다. 선행 수가 `n`이면 생성 `required_mask`는 정확히 `(1U << n) - 1U`이고 `n == 0`이면 `0`이다. TT/CBS entry는 resolved class에 따라 별도로 만든다.
+   - L1 Task는 입력 timing으로 `TtSlot`을, L2 Task는 입력 timing으로 `CbsConfig`를 만든다. Source/Successor는 이 분기를 결정하지 않는다. 배정한 predecessor/destination 쌍마다 outgoing edge를 하나 생성하고, 후보를 반환하기 전 §4.2와 같은 incoming-mask exact equality 검사를 실행한다.
    - O는 DAG 위상 순서를 TT slot 충돌 검사 또는 CBS admission 검사의 tie-breaker로만 사용한다.
 4. **Phase 0 배치와 이관**:
    - 같은 workload 안에서 명시/상속 class가 혼합된 Task를 지원하고 기존 TT placement 및 CBS admission/worst-fit을 각각 사용한다.
@@ -632,7 +674,8 @@ TT/CBS entry 자체에는 dependency를 중복하지 않는다. O→N DAG metada
 | class 해석 | Task 명시 class는 workload 기본값보다 우선하고, 미지정 Task는 기본값을 상속한다. `predecessors` 유무는 class에 영향을 주지 않는다 |
 | 참조 정규화/거절 | 빈 `workload_id`는 현재 workload로 해석되고, Phase 0 cross-workload 참조·중복 key·hash-pair 충돌·미존재 참조는 활성화 전에 거절된다 |
 | O DAG/배치 | 정규화 key, 위상 순서, TT/CBS 배치가 입력 순서와 무관하며 실행 class는 명시/상속값과 일치한다 |
-| N 등록 | `(workload_id_hash, task_id_hash)` 쌍이 정확히 하나의 TT/CBS entry와 연결되고 클래스가 바뀌지 않는다 |
+| N 등록 | `(workload_id_hash, task_id_hash)` 쌍이 정확히 하나의 TT/CBS entry와 연결되고 클래스가 바뀌지 않는다. 모든 활성 slot에서 두 incoming edge가 같은 bit를 공유하지 않고 incoming-bit OR-union이 `required_mask`와 같으며 `incoming_edge_count == popcount(required_mask)`다. |
+| incoming-bit bijection | 선행 2개 Successor의 bit `0`, `1` 및 `required_mask=0b11` 정상 후보는 승인한다. 별도로 두 incoming edge가 모두 bit `0`, 세 번째 edge 없이 mask가 `0b111`, mask 밖 edge bit인 경우를 거절하고 committed candidate/active SHM 상태가 불변인지 확인한다. |
 | SHM ABI | 784바이트 legacy object에서 TT API만 동작하고 Pipeline API는 `ENOTSUP`; magic/ABI-size 불일치 `EINVAL`, magic이 유효한 미지원 version은 `ENOTSUP`, 범위 초과 접근 없음 |
 | mapping 재검증 | prefix만 덮는 client mapping은 extension 접근 없이 `ENOTSUP`을 반환한다. 별도로 기존 full mapping의 object를 ABI 크기 아래로 truncate하거나 name을 unlink/recreate한 뒤 `signal_ready`/`wait_data`를 호출한다. 둘 다 `pipeline_header`/`pipeline[]` dereference 전에 `ESTALE`을 반환하며 공유 상태 변경과 `SIGBUS`가 없어야 한다. 성공적인 교체에는 caller 재초기화가 필요하다. |
 | 권한 | Pipeline writer의 O_RDWR 실패는 `EACCES`, read-only Successor의 `wait_data`는 성공, `signal_ready`는 `EACCES` |
