@@ -79,29 +79,34 @@ N은 Task의 TT/CBS 표현과 공통 DAG 메타를 각각 확인한다. 이름·
 
 통과한 테이블은 011 규약으로 공통 `pipeline[]`를 채운다. L1 Task는 TT gate, L2 Task는 CBS gate를 사용하도록 어댑터 메타를 등록한다. 게시 자체는 ready/dispatch 순번을 증가시키지 않는다.
 
-새 client는 `fstat()`과 `pipeline_header.magic/version/abi_size`를 확인한 뒤 extension에 접근한다. 게시자는 header 안 `publication_guard`의 writer-pending을 잡아 새 Pipeline commit 진입을 막고 기존 활성 commit이 `0`이 된 뒤 SHM 세대를 홀수/내용 갱신/짝수·`magic` 유효로 전환한다. `signal_ready`와 L1 Timer Master는 packed `ready_state` CAS 또는 `dispatch_counter` 갱신 중 이 guard를 잡아 게시자와 직렬화한다. Phase 0은 최초 게시·종료/무효화와 고정 체인의 guard를 확인하고, Phase 1은 Pipeline 정상 갱신과 ABI 전환에, Phase 2는 실패·재시작 후 미회수 상태 정리에 이 규약을 확장한다.
+client는 초기화와 각 Pipeline API transaction 전에 보유 mapping 범위, mapped fd의 현재 `fstat()` 크기, SHM name이 같은 file identity로 resolve되는지를 확인하고 그 뒤에만 `pipeline_header.magic/version/abi_size`를 읽는다. 축소 또는 교체는 extension dereference 전에 `ESTALE`이다. `Timpani-N`은 live object를 전체 ABI 크기로 유지하고 교체는 무효화 + active commit drain + `unlink`로 수행하며 inplace shrink하지 않는다.
+
+게시자는 header 안 `publication_guard`의 writer-pending을 잡아 새 Pipeline commit 진입을 막고 기존 활성 commit이 `0`이 된 뒤 SHM 세대를 홀수/내용 갱신/짝수·`magic` 유효로 전환한다. `signal_ready`와 L1 Timer Master는 packed `ready_state` CAS 또는 `dispatch_counter` 갱신 중 이 guard를 잡아 게시자와 직렬화한다. Phase 0은 최초 게시·종료/무효화, 축소/교체 거절, 고정 체인의 guard를 확인하고, Phase 1은 Pipeline 정상 갱신과 ABI 전환에, Phase 2는 실패·재시작 후 미회수 상태 정리에 이 규약을 확장한다.
 
 ### 3.3 H-DD-P0-03 — 공통 ready/dispatch 상태 전이와 제어 wake 분리
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING_DATA: 안정 게시 초기화 (ready_state mask = 0)
+    [*] --> WAITING_DATA: 안정 게시 (활성 job token k, mask = 0)
 
-    WAITING_DATA --> PARTIAL_READY: 일부 선행 ready
-    PARTIAL_READY --> PARTIAL_READY: 반복/추가 ready (미충족)
+    WAITING_DATA --> PARTIAL_READY: token k의 첫 선행 ready
+    PARTIAL_READY --> PARTIAL_READY: token k의 다른 선행 추가
+    PARTIAL_READY --> PARTIAL_READY: 같은 선행 token 중복 -> EALREADY
+    WAITING_DATA --> WAITING_DATA: 비활성 token -> ESTALE
+    PARTIAL_READY --> PARTIAL_READY: 비활성 token -> ESTALE
 
-    WAITING_DATA --> DISPATCHING: ALL CAS 소비 -> ready sequence 증가
-    PARTIAL_READY --> DISPATCHING: 마지막 ready -> ALL CAS 소비
+    WAITING_DATA --> DISPATCHING: token k 마지막 선행 -> ALL CAS
+    PARTIAL_READY --> DISPATCHING: token k 마지막 선행 -> ALL CAS
 
-    DISPATCHING --> RUNNING: L1 TT slot에서 D++ / L2 ALL commit에서 D++ 후 wake
-    RUNNING --> WAITING_DATA: 처리 및 후행 signal_ready 후 재대기
+    DISPATCHING --> RUNNING: L1 TT slot / L2 ALL commit에서 D++ 후 wake
+    RUNNING --> WAITING_DATA: token k 처리 후 같은 token 전달
 ```
 
-- packed `ready_state`의 `ALL` CAS부터 계층별 `dispatch_counter` 갱신과 futex wake까지는 게시 commit guard 안에서 수행한다. 64비트 CAS는 mask reset과 ready sequence 증가를 원자적으로 수행한다.
-- `ALL`은 ready sequence만 만든다. L1 Successor는 Timer Master가 자신의 TT slot에서 `pending`을 확인한 경우에만 `dispatch_counter`를 1 증가시키고, L2 Successor는 `ALL` commit에서 1 증가시킨다. `dispatch_counter`만 futex word다.
+- packed `ready_state`의 `ALL` CAS부터 계층별 `dispatch_counter` 갱신과 futex wake까지는 게시 commit guard 안에서 수행한다. 상태를 바꾸기 전에 `signal_ready(k)`는 Source의 전체 outgoing-edge 목록을 검증·preflight하므로 잘못된 metadata 또는 중복/낡은 destination 하나가 있으면 전체 fan-out이 불변이다. 같은 `(predecessor, k)`가 preflight 시 이미 설정됐으면 `EALREADY`, 다른 token이면 `ESTALE`이다. CAS 중 동시 동일 commit이 bit/sequence를 앞서면 수렴으로 처리한다. 하나의 64비트 CAS가 destination mask reset과 ready sequence/job token 증가를 원자적으로 수행한다.
+- `ALL`은 ready sequence만 만든다. L1 Successor는 Timer Master가 자신의 TT slot에서 `pending`을 확인한 경우에만 `dispatch_counter`를 1 증가시키고, L2 Successor는 모든 outgoing-edge CAS가 완료된 `ALL` commit에서 1 증가시킨다. `dispatch_counter`만 futex word다.
 - L1 slot 시 ready가 없으면 wake `0`이다. slot을 지난 ready는 다음 TT slot까지 pending으로 유지하며, Phase 0 정상 시험은 pending 1개까지만 포함한다.
 - futex wake 후 Task가 Runnable이 되어야 기존 BPF 경로가 실행한다. L1은 TT slot에서, L2는 CBS budget/Gap에서 실제 CPU dispatch를 받는다.
-- dispatch 증가가 없는 제어 wake, writer-pending/ABI 불일치, 또는 pending ready가 없는 gate는 실행으로 이어지지 않는다.
+- dispatch 증가가 없는 제어 wake, 축소·교체된 mapping, writer-pending/ABI 불일치, 또는 pending ready가 없는 gate는 실행으로 이어지지 않는다.
 
 ### 3.4 H-DD-P0-04 — 종단 간(E2E) 실행 시퀀스
 
@@ -117,19 +122,22 @@ sequenceDiagram
     participant BPF as scx_timpani
 
     Note over P: Source는 기존 L1 TimerMaster counter 또는 L2 Event release 사용
-    P->>SHM: 출력 게시 후 signal_ready -> predecessor bit 갱신
-    SHM->>SHM: 마지막 입력이면 packed ALL CAS + ready_sequence++
+    P->>SHM: token-k payload 게시 후 signal_ready(k)
+    SHM->>SHM: 전체 outgoing-edge 목록 검증/preflight
+    SHM->>SHM: 실패 plan은 무변경 거절 또는 각 predecessor bit commit
+    SHM->>SHM: 마지막 일치 입력이면 packed ALL CAS + ready_sequence++
     alt D is L1 TT Successor
         A->>SHM: 자기 TT slot에서 pending = modular_gt(R, D) 확인
         A->>SHM: pending이면 dispatch_counter++
         A->>D: futex dispatch wake
     else D is L2 CBS Successor
-        SHM->>SHM: ALL commit에서 dispatch_counter++
+        SHM->>SHM: 전체 outgoing-edge CAS 뒤 dispatch_counter++
         SHM->>D: futex CBS release wake
     end
+    D->>D: wait_data가 token k 반환 후 token-k payload 읽기
     D->>BPF: Runnable, 원래 Task class 유지
     BPF-->>D: TT slot 또는 CBS budget/Gap에 따라 실행
-    D->>SHM: 처리 후 다음 Successor signal_ready
+    D->>SHM: 처리 후 다음 Successor에 signal_ready(k)
 ```
 
 그래프가 같다 해도 Task 클래스는 다를 수 있다. Phase 0 시험은 TT→TT, TT→CBS, CBS→TT, CBS→CBS 연결을 포함한다.
@@ -146,13 +154,14 @@ sequenceDiagram
     participant FUSION as fusion_all (ALL)
     participant PLAN as plan_all (ALL)
 
-    TM->>CAM: L1 Source slot 또는 L2 Source release
-    CAM->>SHM: signal_ready -> Successor ready_state mask = 0b01
-    Note over LIDAR: 다른 선행의 signal_ready 없음
+    TM->>CAM: token k의 L1 Source slot 또는 L2 Source release
+    CAM->>SHM: signal_ready(k) -> Successor ready_state mask = 0b01
+    Note over LIDAR: 다른 선행의 signal_ready(k) 없음
     Note over SHM,FUSION: ALL 미충족이므로 TT/CBS dispatch gate를 열지 않음
-    CAM->>SHM: 동일 선행 반복 신호 -> ready_state mask = 0b01 유지
+    CAM->>SHM: 중복 signal_ready(k) -> EALREADY, mask = 0b01 유지
+    CAM->>SHM: 미래 signal_ready(k+1) -> ESTALE, 상태 불변
     Note over SHM,FUSION: 제어 wake로는 ready/dispatch 순번이 변하지 않음
-    Note over FUSION,PLAN: ALL 조건 미충족 -> 클래스와 무관하게 실행 0회
+    Note over FUSION,PLAN: token-k ALL 미충족 -> 클래스와 무관하게 실행 0회
 ```
 
 ---

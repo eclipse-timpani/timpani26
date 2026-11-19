@@ -79,29 +79,34 @@ N verifies the Task's TT/CBS representation and the common DAG metadata separate
 
 The accepted table is populated with the common `pipeline[]` according to the 011 contract. Adapter metadata is registered so that an L1 Task uses the TT gate and an L2 Task uses the CBS gate. Publication itself does not increment the ready/dispatch sequence.
 
-A new client checks `fstat()` and `pipeline_header.magic/version/abi_size` before accessing the extension. The publisher sets writer-pending in the header guard, waits for active commits to reach `0`, and then transitions SHM through odd `generation`, content update, even `generation`, and valid base/extension magic. `signal_ready` and the L1 Timer Master hold the guard while performing the packed `ready_state` CAS or `dispatch_counter` update. Phase 0 verifies initial publication, invalidation/shutdown, and a fixed chain; Phase 1 extends this to normal Pipeline updates and ABI transitions; Phase 2 adds reclamation after failure or restart.
+At initialization and again before every Pipeline API transaction, the client checks the retained mapping extent, the mapped fd's current `fstat()` size, and that the SHM name still resolves to the same file identity; only then may it read `pipeline_header.magic/version/abi_size`. Truncation or replacement returns `ESTALE` before any extension dereference. Timpani-N keeps a live object at full ABI size and replaces it with invalidation + active-commit drain + `unlink`, not in-place shrink.
+
+The publisher sets writer-pending in the header guard, waits for active commits to reach `0`, and then transitions SHM through odd `generation`, content update, even `generation`, and valid base/extension magic. `signal_ready` and the L1 Timer Master hold the guard while performing the packed `ready_state` CAS or `dispatch_counter` update. Phase 0 verifies initial publication, invalidation/shutdown, truncation/replacement rejection, and a fixed chain; Phase 1 extends this to normal Pipeline updates and ABI transitions; Phase 2 adds reclamation after failure or restart.
 
 ### 3.3 H-DD-P0-03 — Common Ready/Dispatch State Transitions and Control-Wake Separation
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING_DATA: stable publication initialization (ready_state mask = 0)
+    [*] --> WAITING_DATA: stable publication (active job token k, mask = 0)
 
-    WAITING_DATA --> PARTIAL_READY: some predecessors ready
-    PARTIAL_READY --> PARTIAL_READY: repeated/additional ready (not satisfied)
+    WAITING_DATA --> PARTIAL_READY: first predecessor for token k
+    PARTIAL_READY --> PARTIAL_READY: additional distinct predecessor for token k
+    PARTIAL_READY --> PARTIAL_READY: duplicate predecessor token -> EALREADY
+    WAITING_DATA --> WAITING_DATA: nonactive token -> ESTALE
+    PARTIAL_READY --> PARTIAL_READY: nonactive token -> ESTALE
 
-    WAITING_DATA --> DISPATCHING: ALL CAS consumption -> ready sequence increments
-    PARTIAL_READY --> DISPATCHING: last ready -> ALL CAS consumption
+    WAITING_DATA --> DISPATCHING: last predecessor for token k -> ALL CAS
+    PARTIAL_READY --> DISPATCHING: last predecessor for token k -> ALL CAS
 
     DISPATCHING --> RUNNING: D++ at L1 TT slot / L2 ALL commit, then wake
-    RUNNING --> WAITING_DATA: process and signal_ready to Successor, then wait again
+    RUNNING --> WAITING_DATA: process token k and forward the same token
 ```
 
-- The packed `ready_state` `ALL` CAS, layer-specific `dispatch_counter` update, and futex wake are performed inside the publication commit guard. One 64-bit CAS performs mask reset and ready-sequence increment atomically.
-- `ALL` creates only the ready sequence. Timer Master increments `dispatch_counter` for an L1 Successor only at that Task's TT slot when pending exists. An L2 Successor increments it in the `ALL` commit. This field is the sole Data-Driven futex word.
+- The packed `ready_state` `ALL` CAS, layer-specific `dispatch_counter` update, and futex wake are performed inside the publication commit guard. Before changing state, `signal_ready(k)` validates and preflights the Source's complete outgoing-edge list: malformed metadata or any duplicate/stale destination leaves the entire fan-out unchanged. A bit already set for the same `(predecessor, k)` at preflight returns `EALREADY`, and a different token returns `ESTALE`. A concurrent identical commit observed during CAS is convergence, not a late failure. One 64-bit CAS resets a destination mask and increments its ready sequence/job token atomically.
+- `ALL` creates only the ready sequence. Timer Master increments `dispatch_counter` for an L1 Successor only at that Task's TT slot when pending exists. After all outgoing-edge CAS operations complete, an L2 Successor increments `dispatch_counter` in the `ALL` commit and wakes. This field is the sole Data-Driven futex word.
 - An L1 slot with no ready produces `0` wake. A late ready remains pending until the next TT slot; normal Phase 0 tests contain at most one pending ready.
 - After futex wake makes the Task Runnable, existing BPF logic performs actual execution: TT in its slot and CBS under budget/Gap rules.
-- A control wake without a dispatch increment, writer-pending/ABI mismatch, or a gate with no pending ready does not lead to execution.
+- A control wake without a dispatch increment, truncated/replaced mapping, writer-pending/ABI mismatch, or a gate with no pending ready does not lead to execution.
 
 ### 3.4 H-DD-P0-04 — End-to-End (E2E) Execution Sequence
 
@@ -117,19 +122,22 @@ sequenceDiagram
     participant BPF as scx_timpani
 
     Note over P: Source uses the existing L1 TimerMaster counter or L2 Event release
-    P->>SHM: publish output, then signal_ready -> update predecessor bit
-    SHM->>SHM: on the last input, packed ALL CAS + ready_sequence++
+    P->>SHM: publish token-k payload, then signal_ready(k)
+    SHM->>SHM: validate/preflight the complete outgoing-edge list
+    SHM->>SHM: reject a failed plan without mutation, or commit each predecessor bit
+    SHM->>SHM: on the last matching input, packed ALL CAS + ready_sequence++
     alt D is an L1 TT Successor
         A->>SHM: at its TT slot, check pending = modular_gt(R, D)
         A->>SHM: if pending, dispatch_counter++
         A->>D: futex dispatch wake
     else D is an L2 CBS Successor
-        SHM->>SHM: in the ALL commit, dispatch_counter++
+        SHM->>SHM: after all outgoing-edge CAS, dispatch_counter++
         SHM->>D: futex CBS release wake
     end
+    D->>D: wait_data returns token k and reads token-k payload
     D->>BPF: Runnable, retain the original Task class
     BPF-->>D: execute by TT slot or CBS budget/Gap
-    D->>SHM: after processing, signal_ready to the next Successor
+    D->>SHM: after processing, signal_ready(k) to the next Successor
 ```
 
 Even when the graph is the same, Task classes can differ. Phase 0 tests include TT→TT, TT→CBS, CBS→TT, and CBS→CBS connections.
@@ -146,13 +154,14 @@ sequenceDiagram
     participant FUSION as fusion_all (ALL)
     participant PLAN as plan_all (ALL)
 
-    TM->>CAM: L1 Source slot or L2 Source release
-    CAM->>SHM: signal_ready -> Successor ready_state mask = 0b01
-    Note over LIDAR: no signal_ready from the other predecessor
+    TM->>CAM: L1 Source slot or L2 Source release for token k
+    CAM->>SHM: signal_ready(k) -> Successor ready_state mask = 0b01
+    Note over LIDAR: no signal_ready(k) from the other predecessor
     Note over SHM,FUSION: ALL is not satisfied, so do not open the TT/CBS dispatch gate
-    CAM->>SHM: repeated signal from the same predecessor -> ready_state mask remains 0b01
+    CAM->>SHM: duplicate signal_ready(k) -> EALREADY, mask remains 0b01
+    CAM->>SHM: future signal_ready(k+1) -> ESTALE, no state change
     Note over SHM,FUSION: a control wake does not change the ready/dispatch sequence
-    Note over FUSION,PLAN: ALL is not satisfied -> execution count remains 0 regardless of class
+    Note over FUSION,PLAN: token-k ALL is incomplete -> execution count remains 0 regardless of class
 ```
 
 ---
