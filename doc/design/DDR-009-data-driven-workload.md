@@ -39,35 +39,36 @@ flowchart LR
     end
 
     subgraph Dec1["Selected: Common pipeline[] ready + per-layer execution adapter"]
-        C1["SHM: ALL CAS + data/ready sequence"] --> C2["L1 TT adapter: TT slot/Window gate"]
+        C1["SHM: packed ready_state ALL CAS<br/>+ dispatch_counter futex"] --> C2["L1 TT adapter: Task TT slot gate"]
         C1 --> C3["L2 CBS adapter: CBS release + budget gate"]
     end
 ```
 
 - **Decision**:
   - The graph state and atomic consumption of `Data-Ready` are handled commonly in SHM.
-  - Execution dispatch is delegated to the Task's layer. L1 uses the TT slot/Window, and L2 uses the CBS CPU/budget/Gap.
-  - The header (`magic`, `n_tasks`, `generation`) and `tasks[TIMPANI_MAX_TASKS]` array (offset `0..783`) of the existing `struct timpani_ttsched_shm` are kept exactly as is, with no changes to size or offset. A Pipeline-specific `pipeline[TIMPANI_MAX_TASKS]` array is then appended after them.
-  - A `pipeline[i].data_counter`, separate from `tasks[i].counter` used to trigger periodic slots, is also used as the `futex` word dedicated to the Successor Task's `Data-Ready`.
+  - Execution dispatch is delegated to the Task's layer. Phase 0 L1 uses the Task's TT slot, and L2 uses the CBS CPU/budget/Gap. Window is a Phase 1 extension.
+  - Keep the existing header (`magic`, `n_tasks`, `generation`) and `tasks[TIMPANI_MAX_TASKS]` array (offset `0..783`) at exactly the same size and offsets. Append a 16-byte `pipeline_header` containing extension `magic`, ABI `version`, total `abi_size`, and `publication_guard`, followed by `pipeline[TIMPANI_MAX_TASKS]`.
+  - Each Pipeline slot contains `(workload_id_hash, task_id_hash)`, `ready_state`, `required_mask`, `dispatch_counter`, trigger/model, and outgoing edges. `ready_state` packs the high 32-bit ready sequence and low 16-bit predecessor mask into one lock-free 64-bit CAS. `dispatch_counter` is the sole Data-Driven futex word; the existing `tasks[i].counter` remains the TT periodic wake word.
 - **Rationale**:
   1. Going through daemon IPC/gRPC cannot satisfy the `5 μs`-or-less signal-processing requirement (`REQ-DD-P0-N-002`) because of context-switching and serialization latency.
   2. Linux `sched_ext` can schedule only threads that are already `Runnable`; it cannot directly wake a Successor thread that is `Sleeping` from within `kernel` BPF, and it would require granting the container `CAP_BPF` privileges.
   3. The common graph `pipeline[]` has ready/dispatch state independent of the TT `counter`.
   4. The execution layer comes from the Task input and is therefore independent of the DAG role.
-- **Condition**: Approve the SHM fields and API before implementation (`CON-DD-05`).
+- **Condition**: Before implementation, approve extension `magic/version/abi_size`, actual SHM-size validation, lock-free 64-bit `ready_state` CAS, dispatch-only futex, the new API/`errno` contract, and O_RDWR/O_RDONLY permission fallback (`CON-DD-05`).
 - **Not Selected**: Daemon IPC, direct manipulation of BPF Maps by the application, and approaches that force the execution class from `Source/Successor`.
 - **Traceability**: `REQ-DD-P0-F-006`, `F-007`, `N-001`, `N-002`, `N-004`; `OI-DD-02`.
 
 ---
 
-## 3. D-DD-P0-02 (Decision 9B) — Predecessor-Completion Bitmask (`ready_mask`) + Atomic Reset with a Single `CAS` on Wakeup
+## 3. D-DD-P0-02 (Decision 9B) — Single-CAS Update of the Predecessor Mask and Ready Sequence in `ready_state`
 
 - **Decision**:
-  - Assign a bit to each immediate predecessor for every Successor Task. When a single `CAS` satisfies `ALL`, atomically perform `ready_mask=0` and increment `data_counter`.
-  - `data_counter` is the logical ready state. The CBS adapter immediately connects the same ready state to `dispatch_counter` and performs a futex wake, while the TT adapter connects a pending ready state to `dispatch_counter` in an allowed slot. In either case, the adapters do not dispatch the same ready state twice.
+  - Assign a bit to each immediate predecessor for every Successor. The `ALL` operation is one lock-free 64-bit CAS on `ready_state` that resets the predecessor mask and increments the ready sequence. The CAS, `dispatch_counter` update, and futex wake are serialized with publication through the commit guard.
+  - The ready sequence represents logical readiness. The CBS adapter increments `dispatch_counter` and performs a futex wake inside the guard. The TT adapter increments `dispatch_counter` only in an allowed slot when a pending ready sequence exists. Neither adapter dispatches the same sequence twice.
 - **Rationale**:
   - A simple countdown cannot distinguish repeated signals from the same predecessor.
-  - A bitmask CAS finalizes `ALL` ready once, and separating ready from per-layer dispatch allows precise control of both premature L1 TT execution and L2 CBS execution.
+  - Packing mask reset and sequence increment into one CAS removes an observable intermediate state. `dispatch_counter` as the sole wake word prevents a ready-only L1 Task from being awakened before its TT slot.
+  - Generation validation plus CAS alone cannot close the publication/consumer TOCTOU; the guard serializes the complete commit.
   - The Phase 1/2 Window and SKIP state machines are not pre-implemented.
 - **Not Selected**: Simple decrement of a remaining counter and intervention to reset state at a `Timer Master` period boundary in Phase 0.
 - **Traceability**: `REQ-DD-P0-F-005`, `REQ-DD-P0-N-001`.
@@ -77,28 +78,30 @@ flowchart LR
 ## 4. D-DD-P0-03 — Execution-Layer-Independent DAG and TT/CBS Execution Adapters
 
 - **Decision**:
-  - `predecessors` and `trigger_mode` represent only the Task's DAG role and the `ALL` condition; they do not determine L1/L2.
-  - O generates a `TtSlot` or `CbsConfig` according to each Task's existing `TemporalClass`, while the common DAG metadata is linked to the Task hash and transmitted separately.
-  - A Source may also be L1 TT or L2 CBS. An L1 Source starts with Timer Master, and an L2 Source starts with the existing Event release. Both may call `signal_ready` upon completion.
-  - A Successor may also be L1 TT or L2 CBS. `ALL` creates an execution candidate in either layer.
-    - **L1 adapter:** Even when a ready sequence exists, it does not dispatch before an allowed TT slot/Window opens. If ready is present in the slot, it consumes that ready state once.
-    - **L2 adapter:** When a ready sequence is created, it performs a CBS release and follows the CPU, budget, and Gap gates.
-  - N does not recalculate this path; it applies only the received metadata and the per-layer gates.
-- **Rationale**: The core of Data-Driven is dependency ready, while the scheduling layer is already defined for each Task. An L1 successor's premature execution is prevented by the TT adapter, and the L2 successor reuses the CBS rules.
-- **Not Selected**: Inferring the Task class from the presence or absence of `predecessors`, or forcing every Successor to either CBS or TT.
-- **Phase 0 Test Precondition**: The L1 Successor satisfies `ALL` ready before its corresponding TT slot. Delay/SKIP policy for ready that misses a slot is deferred to Phase 1/2.
-- **Traceability**: REQ-DD-001~009, 013; OI-DD-01, OI-DD-03.
+  - `SchedInfo.temporal_class` remains the workload default. `TaskInfo.temporal_class` is `optional`: an explicit Task value wins, and an absent value inherits the workload default. The DAG role does not determine the class. A workload remains the lifecycle/default-class grouping, while the Task override is the 009 extension that determines that Task's TT/CBS layer.
+  - A predecessor is `TaskReference(workload_id, task_id)`. An empty `workload_id` means the current workload, and Phase 0 allows only same-workload references. `predecessors` and `trigger_mode=ALL` do not determine the execution layer.
+  - O generates the existing `TtSlot` or `CbsConfig` from the resolved class, and transmits common DAG metadata separately with a `PipelineTaskKey(workload_id_hash, task_id_hash)`.
+  - A Source may be L1 TT or L2 CBS. An L1 Source retains the existing `tasks[i].counter` Timer Master wake, while an L2 Source retains the existing Event release. Both may call `signal_ready` on completion.
+  - A Successor may be L1 TT or L2 CBS. `ALL` creates only a ready sequence; the execution gate remains layer-specific.
+    - **L1 TT adapter:** Timer Master checks `counter_ahead(ready_sequence, dispatch_counter)` only at that Task's TT slot. If ready is pending, it increments `dispatch_counter` by 1 and wakes the futex. It never wakes before the slot or uses the Source `tasks[i].counter` path for a Pipeline Successor.
+    - **L2 CBS adapter:** The `ALL` commit increments `dispatch_counter` by 1 and wakes the futex. After the Task becomes Runnable, the existing `scx_timpani` CBS DSQ, budget, and Gap gates decide actual CPU execution.
+  - N does not recalculate DAG or schedulability. It applies only the received metadata and per-layer gates, without a separate Data-Driven BPF DSQ.
+- **Rationale**: Separating ready from execution prevents early L1 wake while reusing the existing CBS admission, budget, and Gap logic. Timer Master owns the TT slot, and BPF owns Runnable CBS execution, so their responsibilities do not overlap.
+- **Not Selected**: Inferring class from DAG role, forcing every Successor to one class, using `tasks[i].counter` to wake L1 Successors early, or adding a separate Data-Driven BPF DSQ for L2.
+- **Phase 0 Test Precondition**: Normal testing satisfies `ALL` once before the relevant L1 slot. If no ready exists at that slot, no wake occurs; a late ready remains pending until the next TT slot. More than one pending ready by modulo-sequence comparison is a missed-slot/backlog precondition violation rather than a Phase 0 normal case. `Activation Window`, expiration, and `SKIP` remain Phase 1/2.
+- **Traceability**: REQ-DD-001~009, 013; OI-DD-01, OI-DD-03, OI-DD-05.
 
 ---
 
 ## 5. D-DD-P0-04 — Compliance with the `DDR-011` Phase 0 Stable Publication (`magic`, Even `generation`) and Separation of the Control Wake
 
 - **Decision**:
-  - During SHM publication, populate `tasks[]` and `pipeline[]` and make them valid in the order `n_tasks → even generation → magic`. Publication itself does not increment `counter`, `data_counter`, or `dispatch_counter`.
-  - Consumers (`ttsched_signal_ready`, `ttsched_wait_data`) verify `magic` and an even `generation` in acquire order, look up their own Task name (`tasks[idx].name`) and linkage information, and then recheck `generation`. If the generation is odd, the generation changes, or `magic` is invalid, they return `-1` without touching the shared state (unbounded busy-spin is prohibited).
-  - `ttsched_wait_data()` returns `0` only after verifying a stable generation, its own identity, and an actual increase in `dispatch_counter`. This sequence increases only when the L1 TT slot/Window or L2 CBS release gate consumes the `data_counter` ready state.
-- **Rationale**: Data-Ready publication must be separated from actual scheduler dispatch to prevent both premature L1 TT execution and false L2 CBS activation.
-- **Traceability**: `REQ-DD-P0-F-006`, `REQ-DD-P0-N-004`, `OI-DD-02`.
+  - A Pipeline client accesses extension state only after checking its actual object size and `pipeline_header.magic/version/abi_size`. The publisher sets writer-pending in `pipeline_header.publication_guard`, waits for active commits to reach `0`, and then updates `tasks[]`, the extension header, and `pipeline[]`. Validation follows `magic=0 → odd generation → content update → even generation → valid extension/base magic → writer-pending release`; publication itself does not increment ready or dispatch counters.
+  - Consumers and the L1 Timer Master verify the stable ABI/generation and acquire the guard before mutation. `signal_ready` completes the packed `ready_state` CAS and any `dispatch_counter` increment/futex wake before releasing the guard. ABI, generation, identity, or writer-pending failures return `-1` with `errno` and do not mutate state.
+  - `ttsched_wait_data()` uses only `dispatch_counter` as its futex word and returns `0` only for an actual increase. Publication/shutdown control wake does not increment it and therefore returns `ESTALE`.
+  - **Phase 0:** Apply the guard to initial publication, invalidation/shutdown, and fixed-Pipeline commits, but do not perform normal runtime updates of Pipeline-containing tables. **Phase 1:** Use the same guard at normal update and ABI-transition boundaries. **Phase 2:** Add reclamation rules after update failure, rollback, and process restart.
+- **Rationale**: Without version/size checks, a backward extension may access beyond a legacy SHM object. Without guard serialization, generation validation cannot close the CAS TOCTOU. The versioned extension and complete-commit guard address both ABI and concurrency failure modes.
+- **Traceability**: `REQ-DD-P0-F-005`, `REQ-DD-P0-F-006`, `REQ-DD-P0-N-004`, `OI-DD-02`.
 
 ---
 

@@ -27,7 +27,7 @@ flowchart LR
     subgraph NodeUserspace["Timpani-N & Workload (userspace)"]
         TN_PREP["Timpani-N 비RT 준비<br/>(공통 DAG 확인 · TT/CBS 표현 등록 · SHM 게시)"]
         TM["Timer Master<br/>(L1 TT slot adapter)"]
-        SHM[("/timpani_ttsched SHM<br/>(tasks[] + 공통 pipeline[])")]
+        SHM[("/timpani_ttsched SHM<br/>(tasks[] + versioned pipeline header + pipeline[])")]
         TASKS["Pipeline Tasks<br/>(L1 TT 또는 L2 CBS)"]
     end
 
@@ -58,7 +58,7 @@ flowchart LR
 | **`Timpani-N` 비RT** | 계층별 entry와 공통 `pipeline[]` 로컬 확인·게시 | DAG/TT/CBS 가능성 재계산 |
 | **`Timer Master`** | L1 Task의 허용 slot에서 Data-Driven ready가 있으면 dispatch 어댑터를 연다 | L2 release 담당, L1 ready가 없을 때 실행 |
 | **`libttsched` / 앱** | 클래스와 무관한 `ALL` CAS/ready 순번 갱신·신원 확인 | payload 전달, 제어 wake 실행, 실행 계층 변경 |
-| **`scx_timpani`** | L1은 TT slot/Window, L2는 CBS 예산/Gap의 기존 경로로 dispatch | 별도 Data-Driven 스케줄링 계층 신설 |
+| **`scx_timpani`** | wake로 Runnable이 된 L1은 TT slot에서, L2는 기존 CBS 예산/Gap 경로로 dispatch | 별도 Data-Driven 스케줄링 계층 신설 |
 | **`Fault Monitor`** | 기존 시스템 감시 안전장치 유지 | Phase 0 신규 `DATA_TIMEOUT` 수집·보고 (Phase 2 이관) |
 
 공통 DAG 메타 전달, SHM 후방 `pipeline[]`, 신규 API는 사전 승인 후 반영한다. Task의 기존 TT/CBS entry와 timing 정책은 보존한다.
@@ -69,9 +69,9 @@ flowchart LR
 
 ### 3.1 H-DD-P0-01 — 오프라인 후보 검증과 결정적 위상 배치 (`Timpani-O`)
 
-O는 DAG를 검증하고 Task hash별 공통 의존성 메타를 만든다. 각 Task는 입력 `TemporalClass`에 따라 기존 `TtSlot` 또는 `CbsConfig` 표현을 유지한다. `predecessors` 유무로 실행 계층을 추론하지 않는다.
+O는 `TaskInfo.temporal_class` 명시값을 우선하고, 미지정이면 `SchedInfo.temporal_class`를 상속해 각 Task의 실행 계층을 결정한다. `TaskReference(workload_id, task_id)` 선행 목록을 같은 workload의 정규화 Task 식별자로 변환하고 DAG를 검증한 뒤, `(workload_id_hash, task_id_hash)` key별 공통 의존성 메타를 만든다. 각 Task는 resolved class에 따라 기존 `TtSlot` 또는 `CbsConfig` 표현을 유지하며 `predecessors` 유무로 실행 계층을 추론하지 않는다.
 
-Phase 0는 기존 TT slot/CBS admission 정책을 사용한다. Phase 1에는 혼합 DAG에서 계층별 응답시간을 합산하고 필요한 Window/Gap 조건을 구체화한다. 실패 시 확정 모델은 유지한다.
+Phase 0는 같은 workload 참조와 `ALL`만 허용하고 기존 TT slot/CBS admission 정책을 사용한다. Phase 1에는 cross-workload 참조, 혼합 DAG의 계층별 응답시간 합산, `E2E`, Window/Gap 조건을 확장한다. 실패 시 확정 모델은 유지한다.
 
 ### 3.2 H-DD-P0-02 — 노드 로컬 적합성 확인과 안정 SHM 게시 (`Timpani-N`)
 
@@ -79,24 +79,29 @@ N은 Task의 TT/CBS 표현과 공통 DAG 메타를 각각 확인한다. 이름·
 
 통과한 테이블은 011 규약으로 공통 `pipeline[]`를 채운다. L1 Task는 TT gate, L2 Task는 CBS gate를 사용하도록 어댑터 메타를 등록한다. 게시 자체는 ready/dispatch 순번을 증가시키지 않는다.
 
+새 client는 `fstat()`과 `pipeline_header.magic/version/abi_size`를 확인한 뒤 extension에 접근한다. 게시자는 header 안 `publication_guard`의 writer-pending을 잡아 새 Pipeline commit 진입을 막고 기존 활성 commit이 `0`이 된 뒤 SHM 세대를 홀수/내용 갱신/짝수·`magic` 유효로 전환한다. `signal_ready`와 L1 Timer Master는 packed `ready_state` CAS 또는 `dispatch_counter` 갱신 중 이 guard를 잡아 게시자와 직렬화한다. Phase 0은 최초 게시·종료/무효화와 고정 체인의 guard를 확인하고, Phase 1은 Pipeline 정상 갱신과 ABI 전환에, Phase 2는 실패·재시작 후 미회수 상태 정리에 이 규약을 확장한다.
+
 ### 3.3 H-DD-P0-03 — 공통 ready/dispatch 상태 전이와 제어 wake 분리
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING_DATA: 안정 게시 초기화 (ready_mask = 0)
+    [*] --> WAITING_DATA: 안정 게시 초기화 (ready_state mask = 0)
 
     WAITING_DATA --> PARTIAL_READY: 일부 선행 ready
     PARTIAL_READY --> PARTIAL_READY: 반복/추가 ready (미충족)
 
-    WAITING_DATA --> DISPATCHING: ALL CAS 소비 -> ready 순번 증가
+    WAITING_DATA --> DISPATCHING: ALL CAS 소비 -> ready sequence 증가
     PARTIAL_READY --> DISPATCHING: 마지막 ready -> ALL CAS 소비
 
-    DISPATCHING --> RUNNING: TT slot gate 또는 CBS release gate
+    DISPATCHING --> RUNNING: L1 TT slot에서 D++ / L2 ALL commit에서 D++ 후 wake
     RUNNING --> WAITING_DATA: 처리 및 후행 signal_ready 후 재대기
 ```
 
-- `ALL`은 ready 순번만 만든다. L1 adapter는 허용 TT slot/Window가 열릴 때만, L2 adapter는 CBS release/예산/Gap 조건에서만 dispatch 순번을 연다.
-- 제어 wake나 ready가 없는 dispatch 게이트는 실행으로 이어지지 않는다.
+- packed `ready_state`의 `ALL` CAS부터 계층별 `dispatch_counter` 갱신과 futex wake까지는 게시 commit guard 안에서 수행한다. 64비트 CAS는 mask reset과 ready sequence 증가를 원자적으로 수행한다.
+- `ALL`은 ready sequence만 만든다. L1 Successor는 Timer Master가 자신의 TT slot에서 `pending`을 확인한 경우에만 `dispatch_counter`를 1 증가시키고, L2 Successor는 `ALL` commit에서 1 증가시킨다. `dispatch_counter`만 futex word다.
+- L1 slot 시 ready가 없으면 wake `0`이다. slot을 지난 ready는 다음 TT slot까지 pending으로 유지하며, Phase 0 정상 시험은 pending 1개까지만 포함한다.
+- futex wake 후 Task가 Runnable이 되어야 기존 BPF 경로가 실행한다. L1은 TT slot에서, L2는 CBS budget/Gap에서 실제 CPU dispatch를 받는다.
+- dispatch 증가가 없는 제어 wake, writer-pending/ABI 불일치, 또는 pending ready가 없는 gate는 실행으로 이어지지 않는다.
 
 ### 3.4 H-DD-P0-04 — 종단 간(E2E) 실행 시퀀스
 
@@ -111,17 +116,19 @@ sequenceDiagram
     participant A as TT/CBS adapter
     participant BPF as scx_timpani
 
-    Note over P: Source는 L1 TimerMaster 또는 L2 Event release로 시작
-    P->>SHM: 출력 게시 후 signal_ready -> ready bit 갱신
-    SHM->>SHM: 마지막 입력이면 ALL CAS + ready sequence++
-    alt D is L1 TT
-        A->>SHM: 허용 TT slot/Window에서 pending ready 확인
-        A->>D: dispatch wake
-    else D is L2 CBS
-        A->>D: CBS release wake
+    Note over P: Source는 기존 L1 TimerMaster counter 또는 L2 Event release 사용
+    P->>SHM: 출력 게시 후 signal_ready -> predecessor bit 갱신
+    SHM->>SHM: 마지막 입력이면 packed ALL CAS + ready_sequence++
+    alt D is L1 TT Successor
+        A->>SHM: 자기 TT slot에서 pending = modular_gt(R, D) 확인
+        A->>SHM: pending이면 dispatch_counter++
+        A->>D: futex dispatch wake
+    else D is L2 CBS Successor
+        SHM->>SHM: ALL commit에서 dispatch_counter++
+        SHM->>D: futex CBS release wake
     end
     D->>BPF: Runnable, 원래 Task class 유지
-    BPF-->>D: TT slot 또는 CBS Gap에서 실행
+    BPF-->>D: TT slot 또는 CBS budget/Gap에 따라 실행
     D->>SHM: 처리 후 다음 Successor signal_ready
 ```
 
@@ -140,10 +147,10 @@ sequenceDiagram
     participant PLAN as plan_all (ALL)
 
     TM->>CAM: L1 Source slot 또는 L2 Source release
-    CAM->>SHM: signal_ready -> Successor ready_mask = 0b01
+    CAM->>SHM: signal_ready -> Successor ready_state mask = 0b01
     Note over LIDAR: 다른 선행의 signal_ready 없음
     Note over SHM,FUSION: ALL 미충족이므로 TT/CBS dispatch gate를 열지 않음
-    CAM->>SHM: 동일 선행 반복 신호 -> ready_mask = 0b01 유지
+    CAM->>SHM: 동일 선행 반복 신호 -> ready_state mask = 0b01 유지
     Note over SHM,FUSION: 제어 wake로는 ready/dispatch 순번이 변하지 않음
     Note over FUSION,PLAN: ALL 조건 미충족 -> 클래스와 무관하게 실행 0회
 ```

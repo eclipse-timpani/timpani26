@@ -131,9 +131,11 @@ Data-Driven Workload는 [REQ-011](REQ-011-runtime-table-update.md)과 동일한 
 - **런타임 테이블 갱신([DDR-011](DDR-011-runtime-table-update.md))과의 경계:**
   - Phase 0 시험 중에는 **Pipeline이 포함된 테이블에 대한 런타임 갱신(`UPD-REPLACE / ADD / REMOVE / CLEAR`)을 수행하지 않는다**. Pipeline 포함 테이블의 정상 경계 전환 정합성(`REQ-DD-016`)은 Phase 1, 갱신 실패·롤백·복구 `STOP`·재시작 시 상태 초기화(`REQ-DD-014`)는 Phase 2로 이관한다.
   - 단, **[DDR-011](DDR-011-runtime-table-update.md) Phase 0 기준선과의 공유 인터페이스 정합**은 Phase 0 필수 범위이다:
-    1. `/timpani_ttsched` SHM 및 `libttsched` Pipeline 경로는 `magic`과 안정 `generation`(짝수 세대, 전후 세대 일치, 태스크 신원 확인)이 확인된 경우에만 동작하며, 게시 중(홀수 세대)이거나 무효한 스냅샷에서는 상태를 변경하지 않고 `-1`을 반환한다.
-    2. 테이블 게시 알림, 종료 알림, 슬롯 재사용 등 실제 `Data-Ready` 카운터 증가가 없는 **제어 wake**는 후행 태스크 실행으로 소비하지 않는다.
-    3. Pipeline을 포함하지 않는 일반 L1 TT 테이블에 대해서는 [REQ-011](REQ-011-runtime-table-update.md) Phase 0 정상 갱신 수용 기준(`AC-P0-01` ~ `08`)에 회귀가 없어야 한다.
+    1. `/timpani_ttsched` 기존 784바이트 prefix는 바꾸지 않는다. Pipeline extension은 `magic`, ABI `version`, 전체 `abi_size`, 실제 `fstat()` 크기, 안정 `generation`, Task 신원을 모두 확인한 경우에만 접근한다. 구 SHM에서는 기존 TT API만 유지하고 Pipeline API는 `ENOTSUP`을 반환한다.
+    2. commit guard는 packed `ready_state`의 단일 64비트 CAS(mask reset + ready-sequence 증가), L2/L1 `dispatch_counter` 갱신 및 futex wake를 게시 세대 전환과 직렬화한다. 64비트 CAS는 대상 환경에서 lock-free여야 하며, `dispatch_counter`만 futex wait/wake word로 사용한다.
+    3. 테이블 게시 알림, 종료 알림, 슬롯 재사용 등 `dispatch_counter` 증가가 없는 **제어 wake**는 후행 태스크 실행으로 소비하지 않는다. Pipeline API는 publish/write-permission/ABI 실패를 `errno`로 구분해 변경 없이 실패해야 한다.
+    4. Pipeline을 포함하지 않는 일반 L1 TT 테이블에 대해서는 [REQ-011](REQ-011-runtime-table-update.md) Phase 0 정상 갱신 수용 기준(`AC-P0-01` ~ `08`)에 회귀가 없어야 한다.
+  - **단계 경계:** Phase 0은 최초 게시·무효화와 고정 Pipeline commit 직렬화를 요구하지만 Pipeline을 포함한 정상 런타임 갱신은 수행하지 않는다. Phase 1은 같은 guard를 Pipeline 경계 갱신에 적용하고, Phase 2는 갱신 실패·rollback·재시작에서 남은 guard/상태 회수를 추가한다.
 - **입력 및 역할 분담:** O는 DAG와 Task의 기존 L1/L2 배치를 각각 검증한다. N은 공통 SHM 그래프만 게시하고, TT Task는 TimerMaster/TT gate, CBS Task는 CBS gate를 사용한다. `Data-Ready` 자체는 실행 계층을 재분류하거나 CPU를 바꾸지 않는다.
 - **보장 수준:** 부분 선행·제어 wake 시 미실행과 L1/L2 계층별 dispatch 조건을 확인한다. 타임아웃 `SKIP`, `DATA_TIMEOUT`, 정량적 최악 `E2E`는 후속 단계 대상이다.
 
@@ -143,14 +145,14 @@ Data-Driven Workload는 [REQ-011](REQ-011-runtime-table-update.md)과 동일한 
 
 | 대상 요구사항 | Phase 0 적용 내용 | 후속 보강 |
 |:---|:---|:---|
-| **REQ-DD-001** | 고정 테이블 생성 시 태스크별 선행 의존성 목록(`predecessors`) 파싱 및 순환 의존성·자기 참조·미존재 태스크 참조·이름/해시 충돌·용량 초과 사전 거절(확정 모델 불변) | `E2E deadline` `Feasibility` 검증 및 런타임 갱신 후보 테이블 검증 확장: Phase 1 |
-| **REQ-DD-002** | O는 DAG 역할과 Task 실행 계층을 독립적으로 전달한다. 각 Task는 입력의 기존 `TemporalClass`에 따라 TT 또는 CBS 표현을 유지한다 | 계층별 정밀 검증: Phase 1 |
-| **REQ-DD-004** | L1 Task는 TT dispatch 게이트와 `ALL` ready를 모두 만족할 때 실행되고, L2 Task는 `ALL` ready를 CBS gate에 release한다. 제어 wake는 실행으로 소비하지 않는다 | Window/세대 신호 격리: Phase 1 |
-| **REQ-DD-005** | 직속 선행 완료 비트마스크 기반 `ALL` 충족 시 계층별 dispatch를 주기당 1회 허용하고 완료 상태를 원자적으로 소비한다 | Harmonic 다중 주기: Phase 1 |
+| **REQ-DD-001** | 고정 테이블 생성 시 구조화 선행 참조 `TaskReference(workload_id, task_id)`를 해석한다. 빈 `workload_id`는 현재 workload를 뜻하며 Phase 0에는 같은 workload 내 참조만 허용한다. 순환·자기 참조·미존재 참조·Task 식별자 쌍의 중복/해시 충돌·용량 초과는 사전 거절하고 확정 모델을 유지한다 | cross-workload 참조, `E2E deadline` `Feasibility`, 런타임 갱신 후보 검증: Phase 1 |
+| **REQ-DD-002** | `TaskInfo.temporal_class` 명시값은 Task의 실행 계층으로 사용하고, 미지정이면 `SchedInfo.temporal_class`를 상속한다. O는 DAG 역할과 계층을 독립해 TT/CBS 표현과 공통 DAG 메타를 분리하고 O→N은 `(workload_id_hash, task_id_hash)` 쌍으로 식별한다 | 계층별 정밀 검증 및 cross-workload Pipeline: Phase 1 |
+| **REQ-DD-004** | Source는 기존 TT/CBS 경로를 유지한다. L1 Successor는 `ALL` pending ready가 있을 때만 자신의 TT slot에서 `dispatch_counter`를 1회 열고, L2 Successor는 `ALL` commit 시 `dispatch_counter`를 열어 BPF CBS gate에 release한다. 제어 wake는 실행으로 소비하지 않는다 | `Activation Window`/slot miss 만료: Phase 1, `SKIP`: Phase 2 |
+| **REQ-DD-005** | packed predecessor 상태에서 `ALL` 충족 시 계층별 dispatch를 주기당 1회 허용하고 완료 상태를 원자적으로 소비한다. Phase 0에서 앱은 실행 job 완료 후 `signal_ready()`를 최대 1회 호출하고 성공 반환 후 재호출하지 않는다 | job token/idempotency 및 Harmonic 다중 주기: Phase 1 |
 | **REQ-DD-007** | RT critical path에서 블로킹 IPC/gRPC·동적 할당·커널 특권 없이 SHM 원자 연산 + `futex`로 `Data-Ready` 전달 | 멀티코어 동시 경합 정량 검증: Phase 1 |
-| **REQ-DD-008** | L1 Task는 ready + TT slot gate, L2 Task는 ready + CBS gate를 기존 scheduler 경로에서 만족한다 | 계층별 Window/Gap 정밀화: Phase 1 |
-| **REQ-DD-015** | 011 안정 게시와 Task 신원·ready/dispatch 순번 변경을 확인하고, 무효 상태에서는 변경 없이 `-1`을 반환 | ABI 버전 관리·읽기 과도 구간 계약: Phase 1 |
-| **REQ-DD-013** | 고정 기본 체인에서 TT→TT, TT→CBS, CBS→TT, CBS→CBS 연결과 부분 입력/제어 wake, 무효 DAG, 기존 TT/CBS 회귀를 검증 | 혼합 계층 `E2E`·정상 갱신: Phase 1, Fail-Safe: Phase 2 |
+| **REQ-DD-008** | L1 Successor는 ready + 자신의 TT slot gate, L2 Successor는 ready + 기존 CBS CPU/budget/Gap gate를 만족한다. Phase 0에서는 계층별 `dispatch_counter` gate만 집행한다 | `Activation Window`와 Gap 정밀화: Phase 1 |
+| **REQ-DD-015** | 011 안정 게시와 extension `magic/version/abi_size`, Task 신원, commit guard를 확인한다. packed `ready_state` 단일 64비트 CAS와 `dispatch_counter` 갱신/wake를 게시자와 같은 세대 순서로 직렬화하고, 구 ABI·무효 snapshot·writer-pending 상태에서는 변경 없이 실패한다 | Pipeline 정상 갱신 경계 적용: Phase 1, 실패/재시작의 guard 회수: Phase 2 |
+| **REQ-DD-013** | 고정 기본 체인에서 TT→TT, TT→CBS, CBS→TT, CBS→CBS 연결과 부분 입력/제어 wake, 무효 DAG, 기존 TT/CBS 회귀 및 세대-commit 경쟁을 검증 | 혼합 계층 `E2E`·정상 갱신: Phase 1, Fail-Safe: Phase 2 |
 
 현재 후속 문서([SRS-009](SRS-009-data-driven-workload.md), [HLD-009](HLD-009-data-driven-workload.md), [DDR-009](DDR-009-data-driven-workload.md), [LLD-009](LLD-009-data-driven-workload.md), PLAN-009)는 이 절의 내용만 상세화한다. 후속 단계 항목은 추적용 목록으로 보존하되, 그 내부 상태 플래그·Window 종료 타이머·`SKIP`/복구 상태 기계를 Phase 0 구현 작업으로 끌어오지 않는다.
 
@@ -165,7 +167,7 @@ Data-Driven Workload는 [REQ-011](REQ-011-runtime-table-update.md)과 동일한 
 | **Pipeline** | DAG 의존성으로 연결된 워크로드/태스크 실행 체인 (공통 `Hyperperiod`, `E2E deadline` 보유) | [DDR-001](DDR-001-workload-model.md) §2 |
 | **Task (Source / Successor / Sink)** | 그래프 역할이다. Source는 선행 없는 시작 Task, Successor는 `predecessors`가 있는 Task, Sink는 체인 마지막 Task다. 어느 역할도 L1/L2를 강제하지 않는다 | 본 문서군 |
 | **Data-Ready** | 선행 Task가 출력 데이터를 게시한 뒤 후행 Task의 논리적 ready 상태를 갱신하는 공통 신호. 실제 dispatch는 Task 실행 계층에 위임한다 | 본 문서군 |
-| **실행 어댑터** | Data-Driven ready 조건을 계층별 scheduler에 연결한다. L1은 TT 슬롯/Window gate, L2는 CBS release/예산/Gap gate를 사용한다 | 본 문서군, DDR-007/008 |
+| **실행 어댑터** | Data-Driven ready 조건을 계층별 scheduler에 연결한다. Phase 0에서 L1은 Timer Master TT slot gate, L2는 `ALL` commit release + BPF CBS budget/Gap gate를 사용한다. `Activation Window`는 Phase 1이다 | 본 문서군, DDR-007/008 |
 | **트리거 조건 (`ALL` / `ANY`)** | 직속 선행 ready 조건. Phase 0은 `ALL` 필수, `ANY`는 확장만 고려한다 | 본 문서군 |
 | **Activation Window** | 오프라인에서 검증된 후행 활성화·실행 허용 구간 (`[EST, window_end_us]`). *(Phase 1 적용)* | 본 문서군 |
 | **Harmonic 주기** | 태스크 주기들이 배수 관계를 이루어 `Hyperperiod` 폭발이 없는 주기 구성 | [DDR-004](DDR-004-resource-allocation.md) §8.A |
@@ -260,20 +262,20 @@ flowchart LR
 
 | ID | 요구사항 | 우선 | 단계 | 근거 / 출처 |
 |:---|:---|:-:|:---:|:---|
-| **REQ-DD-001** | **DAG 모델 선언 및 유효성 검증**: 시스템은 태스크(Node), 선행 의존성(Edge), 체인 전체의 `E2E deadline`을 포함하는 비순환 방향 그래프(DAG) 형태의 Pipeline을 선언할 수 있어야 하며(SHALL), 순환 의존성(Cycle), 자기 참조, 존재하지 않는 태스크 참조, 지원 용량·식별자 제약 위반은 스케줄 생성 단계에서 거절되어야 한다. 이 검사는 최초 테이블뿐 아니라 런타임 갱신으로 생성되는 모든 후보 테이블에도 동일하게 적용된다([REQ-011](REQ-011-runtime-table-update.md) F-024, F-050). | M | 0/1 | [SRS-000](SRS-000-timpani-system.md) REQ-DD-001, E-DD-01 |
-| **REQ-DD-002** | **계층 독립 매핑 및 역할 분리**: O는 `predecessors`로 DAG 역할을 결정하고, 각 Task의 입력 `TemporalClass`에 따라 기존 TT/CBS 실행 표현을 별도로 생성한다(SHALL). DAG 참여 여부나 Source/Successor 역할로 Task 클래스를 바꾸어서는 안 된다. N은 스케줄 가능성을 재계산하지 않는다. | M | 0/1 | DDR-001, DDR-002, DDR-007 |
+| **REQ-DD-001** | **DAG 모델 선언 및 유효성 검증**: 시스템은 선행 `TaskReference(workload_id, task_id)` Edge로 구성된 DAG Pipeline을 선언할 수 있어야 한다(SHALL). Phase 0에서 빈 `workload_id`는 현재 workload로 해석하고 다른 workload 참조는 거절한다. 순환, 자기 참조, 미존재 참조, `(workload_id, task_id)` 중복, FNV-1a hash 쌍 충돌, 지원 용량 초과는 스케줄 생성 전에 거절한다. Phase 1은 cross-workload 참조와 `E2E deadline` 검사를 확장한다. | M | 0/1 | [SRS-000](SRS-000-timpani-system.md) REQ-DD-001, E-DD-01 |
+| **REQ-DD-002** | **계층 독립 매핑 및 역할 분리**: `TaskInfo.temporal_class`가 명시되면 그 값을 사용하고, 없으면 `SchedInfo.temporal_class`를 상속해야 한다(SHALL). 이 resolved class는 DAG 역할과 독립이며, O는 기존 TT/CBS 실행 표현을 생성한다. 공통 DAG 메타는 `(workload_id_hash, task_id_hash)` 쌍으로 별도 전달하고 N은 스케줄 가능성을 재계산하지 않는다. workload는 기본 class와 생명주기 묶음을 제공하고 Task override는 Scheduling 계층 결정에 사용한다. | M | 0/1 | DDR-001, DDR-002, DDR-007 |
 | **REQ-DD-003** | **상호 간섭 배제 (FFI)**: `NonSafety` 의존성은 거절하고, 각 Task는 원래 계층의 TT/CBS 간섭·예산 검사에 통과해야 한다(SHALL). | M | 1 | SRS-000 REQ-NFR-002 |
 
 ### 5.2 활성화 및 런타임 집행 (Activation & Execution)
 
 | ID | 요구사항 | 우선 | 단계 | 근거 / 출처 |
 |:---|:---|:-:|:---:|:---|
-| **REQ-DD-004** | **선행 의존성 보장 및 제어 wake 구분**: Successor는 `ALL` ready 전 실행되지 않는다. L1 Successor는 Timer Master/TT gate, L2 Successor는 CBS gate를 추가로 만족해야 한다. 게시·종료·슬롯 재사용 wake는 ready로 취급하지 않는다(SHALL). | M | 0 | UC-DD-01, UC-DD-02 |
-| **REQ-DD-005** | **트리거 조건 지원**: `ALL` 충족 시 계층별 dispatch를 주기당 정확히 1회 허용하고 반복 선행 신호가 다른 입력을 덮어쓰지 않아야 한다(SHALL). `ANY`는 확장 가능한 구조만 유지한다(SHOULD). | M | 0 | UC-DD-01, UC-DD-02 |
+| **REQ-DD-004** | **선행 의존성 보장 및 계층별 gate 연결**: Source는 기존 TT/CBS 활성화를 유지한다. Successor는 `ALL` ready 전 실행되지 않아야 하며, L1 Successor는 Timer Master가 자신의 TT slot에서 pending ready를 확인해 `dispatch_counter`를 열고, L2 Successor는 `ALL` commit에서 `dispatch_counter`를 연 뒤 기존 CBS CPU/budget/Gap gate를 따라야 한다(SHALL). 게시·종료·슬롯 재사용 wake는 dispatch로 취급하지 않는다. | M | 0 | UC-DD-01, UC-DD-02 |
+| **REQ-DD-005** | **트리거 조건 지원**: `ALL` 충족 시 계층별 dispatch를 주기당 정확히 1회 허용하고 반복 선행 신호가 다른 입력을 덮어쓰지 않아야 한다(SHALL). Phase 0 앱은 출력 기록 후 실행 job마다 `signal_ready()`를 최대 1회 호출하고 성공 후 재호출하지 않는다(SHALL). `ANY` 및 job token/idempotency는 확장 가능한 구조만 유지한다(SHOULD). | M | 0 | UC-DD-01, UC-DD-02 |
 | **REQ-DD-006** | **Activation Window 강제**: 실행 계층과 무관하게 L1/L2 계층의 기존 시간 게이트 위에 `Activation Window`를 결합한다(SHALL). Phase 1부터 `ALL` ready 전이나 Window 밖에서는 실행되지 않는다. | M | 1 | UC-DD-03 |
 | **REQ-DD-007** | **저지연 Data-Ready 동기화**: 데이터 완료 신호 전달 및 대기는 RT critical path 내 블로킹 IPC/gRPC, 동적 메모리 할당, 커널 특권(`CAP_BPF`) 없이 `/timpani_ttsched` 공유 메모리(SHM)와 `futex` 기반의 `libttsched` API로 수행되어야 한다(SHALL). | M | 0 | [SRS-000](SRS-000-timpani-system.md) REQ-NFR-003, [DDR-006](DDR-006-communication-architecture.md) |
-| **REQ-DD-008** | **계층별 정적 집행**: `ALL`이 충족된 L1 Task는 원래 TT slot/Window에서만, L2 Task는 원래 CBS CPU·예산·Gap 정책에서만 실행되어야 한다(SHALL). DAG 메타데이터는 기존 scheduler의 타이밍 규칙을 우회하지 않는다. | M | 0 | DDR-005, DDR-007, 008 |
-| **REQ-DD-015** | **SHM 인터페이스 및 게시 유효성**: Pipeline 경로는 011의 `magic`/안정 `generation`/Task 신원을 따르고, L1/L2 `dispatch_counter`의 실제 증가가 확인될 때만 실행해야 한다. ready는 있어도 dispatch가 없는 상태를 실행하지 않으며, 무효 상태에서는 `-1`을 반환한다(SHALL). | M | 0/1 | REQ-011 F-037/038/041 |
+| **REQ-DD-008** | **계층별 정적 집행**: `ALL` pending ready가 있는 L1 Successor는 허용 TT slot에서만 `dispatch_counter` gate가 열려야 하며, L2 Successor는 `ALL` commit에서 gate가 열린 뒤 원래 CBS CPU·예산·Gap 정책에서만 실행되어야 한다(SHALL). Phase 0은 `Activation Window`를 적용하지 않고, DAG metadata는 기존 scheduler timing/budget 규칙을 우회하지 않는다. | M | 0 | DDR-005, DDR-007, 008 |
+| **REQ-DD-015** | **SHM 인터페이스 및 게시 유효성**: Pipeline 경로는 기존 784바이트 prefix를 보존하고 extension `magic`/ABI `version`/전체 `abi_size`/실제 SHM 크기를 확인한 뒤에만 동작해야 한다(SHALL). `ready_state`는 predecessor mask와 ready sequence를 묶은 64비트 lock-free CAS로 갱신하며, L1/L2 `dispatch_counter`만 futex wait/wake word로 사용한다. packed CAS, dispatch 갱신, wake는 commit guard로 게시 세대 전환과 직렬화하고, 실제 dispatch 증가가 없거나 ABI·generation·writer-pending 상태가 무효하면 변경 없이 `-1`과 `errno`를 반환해야 한다. | M | 0/1/2 | REQ-011 F-037/038/041 |
 
 ### 5.3 오프라인 스케줄링 (`Timpani-O`)
 
@@ -288,7 +290,7 @@ flowchart LR
 |:---|:---|:-:|:---:|:---|
 | **REQ-DD-011** | **입력 타임아웃 및 연쇄 지연 차단**: Window 종료까지 `ALL` 미충족이면 해당 체인 instance를 `SKIP`해 연쇄 지연을 막아야 한다(SHALL). Sink/Fallback Task는 자신의 TT 또는 CBS 실행 규칙에서 유효한 출력 유지 전략을 적용할 수 있어야 하며, 009가 Sink를 특정 클래스에 고정해서는 안 된다. | M | 2 | E-DD-02 |
 | **REQ-DD-012** | **원인 태스크 장애 보고**: 입력 누락 타임아웃 시 하위 태스크의 연쇄 중복 보고 없이 최초 미완료 선행 태스크만 식별하여 `DATA_TIMEOUT` Fault로 보고(`FaultInfo`)해야 하며(SHALL), 보고 조건은 [DDR-012](DDR-012-fault-management.md)의 임계값(`current_limit`) 정책을 따른다. | M | 2 | [DDR-012](DDR-012-fault-management.md), E-DD-02 |
-| **REQ-DD-014** | **Pipeline 상태 안전 초기화 (비정상 상황)**: 런타임 갱신의 활성화 실패·롤백, 워크로드 복구 `STOP`/`RESTART`, `Timpani-N` 재시작 시 Pipeline 런타임 상태(선행 완료 정보, Window 상태)는 초기화되어야 하며(SHALL), 이전 주기나 이전 테이블의 잔여 상태로 인해 후행 태스크가 잘못 wakeup되어서는 안 된다. 복구 `STOP`으로 제거 중인 Pipeline 태스크는 이전 테이블 복원을 이유로 다시 wakeup되어서는 안 된다([REQ-011](REQ-011-runtime-table-update.md) F-030). | M | 2 | E-DD-03, [REQ-011](REQ-011-runtime-table-update.md) Phase 2 |
+| **REQ-DD-014** | **Pipeline 상태 안전 초기화 (비정상 상황)**: 런타임 갱신의 활성화 실패·롤백, 워크로드 복구 `STOP`/`RESTART`, `Timpani-N` 재시작 시 Pipeline 런타임 상태(선행 완료 정보, Window 상태, `pipeline_header.publication_guard`의 writer-pending/활성 commit 상태)는 초기화되어야 하며(SHALL), 이전 주기나 이전 테이블의 잔여 상태로 인해 후행 태스크가 잘못 wakeup되어서는 안 된다. 복구 `STOP`으로 제거 중인 Pipeline 태스크는 이전 테이블 복원을 이유로 다시 wakeup되어서는 안 된다([REQ-011](REQ-011-runtime-table-update.md) F-030). | M | 2 | E-DD-03, [REQ-011](REQ-011-runtime-table-update.md) Phase 2 |
 
 ### 5.5 런타임 Schedule Table 갱신 연계 (Runtime Table Update)
 
@@ -397,15 +399,15 @@ Phase 0에서는 고정 `Epoch`/`Hyperperiod` 시험 테이블과 기존 노드 
 
 | 해소 단계 | 항목 | 현재 처리 기준 |
 |:---|:---|:---|
-| **Phase 0** | OI-DD-01, OI-DD-02, OI-DD-03 | 실행 클래스와 독립인 공통 DAG 메타 전달, SHM/API, L1/L2 실행 어댑터 연결과 혼합 조합 시험 |
+| **Phase 0** | OI-DD-01, OI-DD-02, OI-DD-03 | Task class explicit-over-inherit, 같은 workload의 `TaskReference`, hash-pair 공통 DAG 메타, SHM/API, L1/L2 adapter 및 혼합 조합 시험 |
 | **Phase 1** | OI-DD-04, OI-DD-05, OI-DD-06 | 계층별 Window/예산과 혼합 DAG `E2E`, Pipeline 갱신 |
 | **Phase 2** | OI-DD-07, OI-DD-08 | `DATA_TIMEOUT` 및 계층 공통 복구 상태 초기화 |
 
 | ID | 미결 / 승인 항목 | 관련 요구사항 |
 |:---|:---|:---|
-| **OI-DD-01** | Task 실행 클래스의 explicit/inherit 전달 규칙과 클래스 독립 공통 DAG 메타(`predecessors`, trigger, E2E)를 정의한다. DAG 역할로 클래스를 추론하지 않으며, 혼합 클래스 submission 표현을 정한다 **(인터페이스 승인)** | REQ-DD-001, 002, CON-DD-05 |
-| **OI-DD-02** | SHM 공통 `pipeline[]` API와 L1/CBS 실행 어댑터의 준비/dispatch 분리 **(SHM/API 승인)** | REQ-DD-005, 007, 015, CON-DD-05 |
-| **OI-DD-03** | L1 Successor의 TT slot/Window gate와 L2 Successor의 CBS release gate를 공통 `ALL` 상태에 연결하는 최소 규약 | REQ-DD-004, 008, 009, 013 |
+| **OI-DD-01** | Phase 0 Task 인터페이스를 다음과 같이 정의한다: `TaskInfo.temporal_class`는 `optional`이며 명시값이 우선이고 미지정 시 `SchedInfo.temporal_class`를 상속한다. `predecessors`는 `TaskReference(workload_id, task_id)`로 표현하되 Phase 0에는 현재 workload 내부 참조만 허용한다. O는 DAG 역할로 클래스를 추론하지 않고 실행 표현과 공통 DAG 메타를 분리하며, O→N의 Task 식별자는 `(workload_id_hash, task_id_hash)` 쌍으로 전달한다. 트리거는 `ALL`만 지원하고, `E2E`는 Phase 1 OI-DD-05로 이관한다 **(인터페이스 승인)** | REQ-DD-001, 002, CON-DD-05 |
+| **OI-DD-02** | Phase 0 SHM extension ABI는 기존 784바이트 prefix 뒤에 `magic/version/abi_size/publication_guard` header와 `pipeline[]`를 추가한다. `ready_state`는 mask+ready sequence의 64비트 lock-free CAS, `dispatch_counter`는 유일한 futex word로 고정한다. ABI/permission/error 계약, O_RDWR/O_RDONLY fallback, 구 ABI 호환, 제어 wake, lock-free/호환성·경쟁 시험을 모두 명세하면 설계를 조건부 승인한다. 시험 미충족 시 구현 병합 승인은 보류한다 **(조건부 SHM/API 승인)** | REQ-DD-005, 007, 015, CON-DD-05 |
+| **OI-DD-03** | Phase 0 실행 연결은 다음을 조건으로 승인한다. L1/L2 Source는 기존 TT/CBS 활성화 경로를 유지한다. L1 Successor는 Timer Master가 자신의 TT slot에서 pending ready를 확인한 경우에만 `dispatch_counter`를 1 증가시키고 wake하며, L2 Successor는 `ALL` commit에서 1 증가시키고 wake한 뒤 BPF가 기존 CBS budget/Gap을 집행한다. slot에 ready가 없으면 wake `0`, 늦은 ready는 다음 slot까지 pending이며 정상 Phase 0 조건은 pending 최대 1개다. `Activation Window`/timeout/`SKIP`는 Phase 1/2로 이관한다. gate·mixed-class·no-ready 시험이 모두 통과하면 설계를 확정하고, 미통과 시 구현 병합을 보류한다 **(조건부 Phase 0 실행 연결 승인)** | REQ-DD-004, 008, 009, 013 |
 | **OI-DD-04** | 공통 `Activation Window`와 계층별 slot/budget gate 동기화 **(인터페이스 승인)** | REQ-DD-006, 009, CON-DD-05 |
 | **OI-DD-05** | 혼합 L1/L2 DAG에서 TT/ CBS 지연을 합산하는 `E2E Feasibility` 식과 복수 경로 선택 | REQ-DD-009, 010 |
 | **OI-DD-06** | Pipeline 포함 테이블 갱신에서 L1/L2 chain instance 완료·안전 종료와 공통 metadata 전환 조건, SHM 버전 관리 | REQ-DD-015, 016 |

@@ -43,18 +43,18 @@ Harmonic multi-period chains, precise time windows by layer, quantitative `E2E F
 
 | ID | Requirement Specification | Parent REQ | REQ Acceptance Criteria |
 |:---|:---|:---|:---|
-| **REQ-DD-P0-F-001** | Only `Timpani-O` shall parse and validate Pipeline predecessor dependencies (`predecessors`). During schedule generation, reject, with a reason, inputs containing a cycle, self-reference, reference to a nonexistent task, invalid or duplicate task names or hash collisions, or values exceeding the supported limits (a maximum of `16` predecessors and a maximum of `8` outgoing edges). Such rejection shall not change the existing committed model or the node's active table. | REQ-DD-001 | AC-DD-P0-01, AC-DD-P0-04 |
-| **REQ-DD-P0-F-002** | O shall derive Source/Successor roles from `predecessors` while preserving the Task's `TemporalClass`. It shall publish L1 as the existing `TtSlot`, publish L2 as the existing `CbsConfig`, and transmit the common DAG metadata separately. | REQ-DD-002, 009 | AC-DD-P0-01, AC-DD-P0-05, AC-DD-P0-06 |
-| **REQ-DD-P0-F-003** | N shall verify the common DAG reference and the layer-specific TT/CBS representation, CPU, and capacity of the Task, and reject unsuitable candidates. It shall not recompute the TT/CBS admission equations. | REQ-DD-001, 002, CON-DD-03 | AC-DD-P0-04 |
+| **REQ-DD-P0-F-001** | Only `Timpani-O` shall resolve and validate predecessor dependencies expressed as `TaskReference(workload_id, task_id)`. An empty `workload_id` shall normalize to the current workload, and another workload reference shall be rejected in Phase 0. Cycles, self-reference, nonexistent references, duplicate Task pairs, `(workload_id_hash, task_id_hash)` collisions, more than `16` predecessors, or more than `8` outgoing edges shall be rejected with a reason without changing the committed model or active table. | REQ-DD-001 | AC-DD-P0-01, AC-DD-P0-04 |
+| **REQ-DD-P0-F-002** | O shall use an explicitly present `TaskInfo.temporal_class`, otherwise inherit `SchedInfo.temporal_class`. It shall preserve the resolved class while creating the existing `TtSlot` or `CbsConfig`, and transmit common DAG metadata separately with the `(workload_id_hash, task_id_hash)` pair. | REQ-DD-002, 009 | AC-DD-P0-01, AC-DD-P0-05, AC-DD-P0-06 |
+| **REQ-DD-P0-F-003** | N shall verify that each common DAG Task key maps to exactly one TT or CBS entry. The key shall be the `(workload_id_hash, task_id_hash)` pair; unsuitable candidates shall be rejected without recomputing TT/CBS admission equations. | REQ-DD-001, 002, CON-DD-03 | AC-DD-P0-04 |
 
 ### 3.2 Runtime `Data-Ready` Synchronization and Scheduling Enforcement (`Timpani-N` & `libttsched`)
 
 | ID | Requirement Specification | Parent REQ | REQ Acceptance Criteria |
 |:---|:---|:---|:---|
-| **REQ-DD-P0-F-004** | A Source shall follow the existing activation mechanism for its execution layer: L1 uses Timer Master, and L2 uses the existing Event release. A Successor shall satisfy both the `ALL` ready condition and the layer-specific dispatch gate. A control wake shall not be consumed as ready. | REQ-DD-002, 004 | AC-DD-P0-01, AC-DD-P0-02 |
-| **REQ-DD-P0-F-005** | When `ALL` is satisfied, the ready state shall be consumed with a single `CAS`, and the common Data-Ready sequence shall be incremented once. The L1/L2 execution adapters shall connect this sequence to the dispatch gate for each layer. | REQ-DD-004, 005, 007 | AC-DD-P0-01, AC-DD-P0-02 |
-| **REQ-DD-P0-F-006** | `signal_ready`/`wait_data` shall verify a stable `generation`, Task identity, and actual changes to the Data-Ready/dispatch sequence. | REQ-DD-004, 015 | AC-DD-P0-03, AC-DD-P0-05 |
-| **REQ-DD-P0-F-007** | An L1 Successor shall execute within an allowed TT slot/Window, and an L2 Successor shall execute within the CBS CPU, budget, and Gap. Neither case shall bypass the scheduling rules of its layer. | REQ-DD-008, 009 | AC-DD-P0-01, AC-DD-P0-05 |
+| **REQ-DD-P0-F-004** | An L1/L2 Source shall retain the existing Timer Master/Event activation path. A Successor shall satisfy `ALL` and its layer-specific dispatch gate, and publication/shutdown/slot-reuse wake shall not become ready or dispatch. | REQ-DD-002, 004 | AC-DD-P0-01, AC-DD-P0-02 |
+| **REQ-DD-P0-F-005** | When `ALL` is satisfied, one lock-free 64-bit CAS on packed `ready_state` shall consume the predecessor mask and increment the ready sequence. That CAS and the L2/Timer Master `dispatch_counter` update and futex wake shall occur inside the publication commit guard. An app shall call `signal_ready()` at most once per completed job and shall not retry after success. | REQ-DD-004, 005, 007 | AC-DD-P0-01, AC-DD-P0-02 |
+| **REQ-DD-P0-F-006** | `signal_ready`/`wait_data` shall verify the actual SHM size, extension `magic/version/abi_size`, stable `generation`, Task identity, and commit guard. `dispatch_counter` shall be the sole futex wait/wake word; ABI, generation, or writer-pending failure shall not mutate state and shall set `errno`. | REQ-DD-004, 015 | AC-DD-P0-03, AC-DD-P0-05 |
+| **REQ-DD-P0-F-007** | Timer Master shall increment and wake an L1 Successor only at its own TT slot when pending ready exists; a slot with no ready shall have `0` dispatch. An L2 Successor shall increment and wake `dispatch_counter` in the `ALL` commit, after which BPF CBS CPU/budget/Gap gates alone decide actual execution. | REQ-DD-008, 009 | AC-DD-P0-01, AC-DD-P0-05 |
 
 ### 3.3 Test Observation and Handling of Departures from Assumptions
 
@@ -68,7 +68,7 @@ Harmonic multi-period chains, precise time windows by layer, quantitative `E2E F
 
 | ID | Requirement Specification | Parent REQ | REQ Acceptance Criteria |
 |:---|:---|:---|:---|
-| **REQ-DD-P0-N-001** | No dynamic memory allocation, blocking IPC/gRPC, file or network I/O, unbounded busy-spin, or lock held across scheduling decisions shall be added to the modified RT critical paths (the `Timer Master` loop, the `libttsched` signal/wait path, or `scx_timpani` callbacks), and workload containers shall operate without `CAP_BPF` privileges. | REQ-DD-007, CON-DD-04 | AC-DD-P0-06 |
+| **REQ-DD-P0-N-001** | No dynamic memory allocation, blocking IPC/gRPC, file or network I/O, unbounded busy-spin, or blocking lock shall be added to the modified RT critical paths. A `publication_guard` reader shall use non-waiting fetch-add/fetch-sub and return `EAGAIN` or `ESTALE` on contention; the publisher shall defer publication after a timeout. The 64-bit `ready_state` atomic SHALL be lock-free on the target architecture, and workload containers SHALL operate without `CAP_BPF`. | REQ-DD-007, CON-DD-04 | AC-DD-P0-06 |
 | **REQ-DD-P0-N-002** | `signal_ready` overhead shall be no more than `5 µs`, and an L1/L2 mixed graph shall not degrade the existing timing criteria of either layer. | REQ-DD-007, 008, 013 | AC-DD-P0-01, AC-DD-P0-05 |
 | **REQ-DD-P0-N-003** | DAG ordering, common dependency metadata, and layer-specific TT/CBS placement shall be independent of input order. The execution layer shall not be determined by the presence or absence of `predecessors`. | REQ-DD-001, 002, 009, CON-DD-04 | AC-DD-P0-05, AC-DD-P0-06 |
 | **REQ-DD-P0-N-004** | Interface changes shall be incorporated after approval, and inputs that exceed the TT/CBS/SHM/edge limits shall be rejected in advance. | REQ-DD-001, 015, CON-DD-05, CON-DD-06 | AC-DD-P0-04, AC-DD-P0-05 |
@@ -81,11 +81,11 @@ Use a fixed `Epoch`/`Hyperperiod` (`100ms`) and a predesignated Isolated CPU wit
 
 | Test ID | Input / Stimulus | Observation and Success Criteria | REQ Acceptance Criteria |
 |:---|:---|:---|:---|
-| **TC-DD-P0-001** | Repeatedly exercise, in a table-driven manner, the minimal L1→L1, L1→L2, L2→L1, and L2→L2 combinations in a fixed DAG. Each Task retains its original class. | Every Successor executes only after `ALL` and complies with the L1 TT gate or the L2 CBS gate. Ordering violations are `0`, and `signal_ready <= 5 µs`. | AC-DD-P0-01 |
-| **TC-DD-P0-002** | Repeatedly complete only some predecessors, with separate L1 and L2 Successors included. | Neither an L1 nor an L2 Successor wakes up or executes (`0` occurrences), and no control wake is falsely consumed. | AC-DD-P0-02 |
-| **TC-DD-P0-003** | Submit a cycle (`A → B → A`), self-reference (`A → A`), nonexistent reference, and capacity/edge-limit overrun to the `Timpani-O` and `Timpani-N` prechecks. | Verify rejection and the reason before activation; the `Timpani-O` committed model and the `Timpani-N` active table and SHM state remain unchanged. | AC-DD-P0-04 |
-| **TC-DD-P0-004** | Call the API at odd `generation` or `magic=0`, and inject a control wake with no ready or dispatch sequence increment. | In an unstable state, the state is unchanged and the result is `-1`; control wake execution is `0`. | AC-DD-P0-03 |
-| **TC-DD-P0-005** | Execute a mixed L1/L2 DAG and the existing TT/CBS regression and 011 normal TT update tests. | After adding the DAG, there are `0` regressions in each Task's existing class or scheduling. | AC-DD-P0-05 |
+| **TC-DD-P0-001** | In a fixed DAG, mix explicit/inherited Task classes and exercise L1→L1, L1→L2, L2→L1, and L2→L2. Place L1 `ALL` before a slot, just after a slot, and omit it; also vary CBS budget and TT-active state. | L1 has `0` pre-slot `dispatch_counter` increments; ready present before a slot increments once at that slot; ready created just after a slot produces `0` wake in that slot and increments once at the next slot. Normal tests contain at most one pending ready. L2 releases exactly once immediately after `ALL`, while actual execution may wait for CBS budget/Gap. Class/order regressions are `0`, and `signal_ready <= 5 µs`. | AC-DD-P0-01 |
+| **TC-DD-P0-002** | Complete only some predecessors for separate L1/L2 Successors, and inject an L1 slot plus a control wake while no ready exists. | Dispatch/wake/execution is `0` for either layer. A control wake returns `ESTALE` and increments no counter. | AC-DD-P0-02 |
+| **TC-DD-P0-003** | Submit a cycle (`A → B → A`), self-reference, nonexistent reference, a Phase 0 reference to another workload, a duplicate Task pair, hash-pair collision, and capacity/edge-limit overruns to the `Timpani-O` and `Timpani-N` prechecks. | Verify rejection and the reason before activation; the `Timpani-O` committed model and the `Timpani-N` active table and SHM state remain unchanged. | AC-DD-P0-04 |
+| **TC-DD-P0-004** | Exercise a legacy 784-byte SHM, extension magic/version/size mismatch, `magic=0`, odd `generation`, writer-pending, O_RDONLY `signal_ready`, and controlled interleavings in which publication starts immediately before or after the packed CAS. Also inject publication/shutdown control wake without a dispatch increment. | Legacy SHM keeps only the TT API while Pipeline APIs return `ENOTSUP`; ABI errors return `EINVAL`, write denial returns `EACCES`, and unstable/control-wake conditions return `ESTALE` without mutation. Packed CAS, dispatch, and wake serialize completely, with `0` mixed-generation records and `0` control-wake executions. | AC-DD-P0-03 |
+| **TC-DD-P0-005** | Exercise the mixed L1/L2 DAG plus existing TT/CBS and 011 normal-update regressions. For TT, create ready before a slot; for CBS, force budget=0 and an active TT interval. | Adding the DAG leaves Sources on their existing counter/Event paths. TT follows the slot gate, CBS follows release then budget/Gap; there are `0` class/scheduling regressions. | AC-DD-P0-05 |
 | **TC-DD-P0-006** | Shuffle the submission order and repeatedly generate the same DAG. | The topological order, common dependency metadata, and layer-specific placement are 100% identical. | AC-DD-P0-06 |
 
 ---
@@ -94,9 +94,9 @@ Use a fixed `Epoch`/`Hyperperiod` (`100ms`) and a predesignated Isolated CPU wit
 
 | REQ Item | Phase 0 Decision / Contract | Detailed Rationale |
 |:---|:---|:---|
-| **OI-DD-01** | Method of transmitting common DAG metadata independently of the Task execution class. Use a single representation or an equivalent lossless representation that does not duplicate dependencies in TT/CBS entries **(approval required)**. | DDR-009 `D-DD-P0-03` |
-| **OI-DD-02** | Common SHM `pipeline[]`, ready/dispatch sequence, `wait_data`/`signal_ready`, and TT/CBS adapter connection **(SHM/API approval)**. | DDR-009 `D-DD-P0-01`, `D-DD-P0-04` |
-| **OI-DD-03** | The Phase 0 minimum protocol for connecting the L1 TT slot gate and the L2 CBS release gate to common `ALL` ready. | DDR-009 `D-DD-P0-03`, `D-DD-P0-05` |
+| **OI-DD-01** | `TaskInfo.temporal_class` follows the optional explicit-over-inherit rule. Transmit the DAG with same-workload `TaskReference` values and identify common O→N metadata with the `(workload_id_hash, task_id_hash)` pair. Support only `ALL` in Phase 0, and defer `E2E` to OI-DD-05 **(Interface Approval)**. | DDR-009 `D-DD-P0-03` |
+| **OI-DD-02** | Append an extension header and `pipeline[]` after the 784-byte prefix. Conditionally approve the design on the ABI/permission/`errno` contract, lock-free 64-bit `ready_state` CAS, dispatch-only futex, O_RDWR/O_RDONLY fallback, legacy-ABI compatibility, and control-wake tests. Withhold implementation approval for any unmet condition **(Conditional SHM/API Approval)**. | DDR-009 `D-DD-P0-01`, `D-DD-P0-04` |
+| **OI-DD-03** | In Phase 0, Sources retain existing TT/CBS paths. L1 increments `dispatch_counter` only at its TT slot when ready is pending; L2 increments in the `ALL` commit and wakes, after which BPF enforces budget/Gap. Conditionally approve missed-slot retention, at most one normal pending ready, and deferral of `Activation Window`/`SKIP`; withhold implementation approval if no-ready, mixed-class, or late-ready tests fail **(Conditional Phase 0 Execution-Connection Approval)**. | DDR-009 `D-DD-P0-03`, `D-DD-P0-05` |
 
 ---
 
@@ -107,6 +107,6 @@ All active requirements in §3 and §4 cite a parent [REQ-009](REQ-009-data-driv
 | Subsequent Phase | Deferred Scope (Not Included in This Document) |
 |:---|:---|
 | **Phase 1** | Window, Harmonic periods, `E2E Feasibility` for mixed L1/L2 DAGs, refinement of layer-specific CPU/slot/budget interference, and Pipeline updates |
-| **Phase 2** | `SKIP`, root-cause `DATA_TIMEOUT`, Sink Fallback, and recovery-state initialization common across classes |
+| **Phase 2** | `SKIP`, root-cause `DATA_TIMEOUT`, Sink Fallback, and common recovery-state initialization including writer-pending/active-commit state |
 
 Do not pre-implement, in Phase 0, the status flags, timer hooks, or recovery state machine for the deferred scope.
