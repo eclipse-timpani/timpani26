@@ -43,7 +43,7 @@ add_custom_command(OUTPUT ${BPF_OBJ}
     COMMAND clang -target bpf -g -O2 -c ${BPF_SRC} -o ${BPF_OBJ} ${BPF_INCLUDES} ${BPF_EXTRA_CFLAGS}
     VERBATIM
     # Added libbpf as a dependency so headers are built before clang runs
-    DEPENDS ${BPF_SRC} ${VMLINUX_H} libbpf
+    DEPENDS ${BPF_SRC} ${VMLINUX_H} libbpf ${ARGN}
 )
 
 add_custom_command(OUTPUT ${SKEL_HDR}

@@ -10,6 +10,7 @@
 #define _LINUX_TYPES_H  // Prevent linux/types.h redefinition clash with
                         // vmlinux.h
 #include "maps.h"
+#include "../../../sample-apps/src/tt_completion.h"
 
 // SCX DSQ IDs
 // TT tasks use SCX_DSQ_LOCAL_ON | cpu directly — no per-CPU TT DSQs.
@@ -253,7 +254,8 @@ s32 BPF_PROG(select_cpu, struct task_struct* p, s32 prev_cpu, u64 wake_flags)
     struct TaskMeta* meta = bpf_map_lookup_elem(&task_meta_map, &pid);
     if (meta && (meta->scheduling_type == SCHED_TYPE_TT ||
                  meta->scheduling_type == SCHED_TYPE_CBS)) {
-        meta->activation_ns = bpf_ktime_get_ns();
+        if (meta->scheduling_type == SCHED_TYPE_CBS)
+            meta->activation_ns = bpf_ktime_get_ns();
         /* Steer to the CPU assigned in the schedule table */
         __u32 cpu = meta->assigned_cpu;
         if (cpu < 64 && (isolated_cpu_mask & (1ULL << cpu))) {
@@ -430,36 +432,38 @@ void BPF_PROG(stopping, struct task_struct* p, bool runnable)
         }
     }
 
-    /* N4: Deadline miss check for TT tasks — lookup from tt_table_map */
-    if (meta->scheduling_type == SCHED_TYPE_TT && !runnable) {
-        __u32 cpu_key = bpf_get_smp_processor_id();
-        __u32* slot_idx = bpf_map_lookup_elem(&current_slot_map, &cpu_key);
-        __u64 deadline_ns = 10000000ULL; /* 10ms fallback */
+    if (meta->scheduling_type == SCHED_TYPE_TT && !runnable)
+        mark_tt_not_runnable(meta, bpf_get_smp_processor_id());
+}
 
-        mark_tt_not_runnable(meta, cpu_key);
-        if (slot_idx) {
-            struct TtSlotKey tt_key = {.cpu = (__u32)cpu_key,
-                                       .slot_idx = *slot_idx};
-            struct TtSlotBpf* slot =
-                bpf_map_lookup_elem(&tt_table_map, &tt_key);
-            if (slot && slot->deadline_us > 0)
-                deadline_ns = (__u64)slot->deadline_us * 1000ULL;
-        }
-        __u64 deadline = meta->activation_ns + deadline_ns;
-        if (now > deadline) {
-            struct FaultEvent* fault;
-            fault = bpf_ringbuf_reserve(&fault_ringbuf, sizeof(*fault), 0);
-            if (fault) {
-                fault->fault_type = FAULT_DMISS;
-                fault->task_id_hash = meta->task_id_hash;
-                fault->workload_id_hash = meta->workload_id_hash;
-                fault->cpu = cpu_key;
-                fault->expected_deadline_ns = deadline;
-                fault->actual_completion_ns = now;
-                bpf_ringbuf_submit(fault, 0);
-            }
-        }
-    }
+/* fentry instead of a syscall tracepoint, which slows every syscall system-wide */
+SEC("fentry/futex_wake")
+int BPF_PROG(tt_job_complete, u32* uaddr, unsigned int flags, int nr_wake,
+             u32 bitset)
+{
+    if (bitset != TIMPANI_TT_COMPLETE_BITSET || nr_wake != 1)
+        return 0;
+
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    struct TaskMeta* meta = bpf_map_lookup_elem(&task_meta_map, &tid);
+    if (!meta || meta->scheduling_type != SCHED_TYPE_TT)
+        return 0;
+
+    struct timpani_tt_completion completion;
+    __u64 now = bpf_ktime_get_tai_ns();
+    if (bpf_probe_read_user(&completion, sizeof(completion), uaddr) ||
+        !completion.deadline_ns || now <= completion.deadline_ns)
+        return 0;
+
+    struct FaultEvent fault = {};
+    fault.fault_type = FAULT_DMISS;
+    fault.task_id_hash = meta->task_id_hash;
+    fault.workload_id_hash = meta->workload_id_hash;
+    fault.cpu = bpf_get_smp_processor_id();
+    fault.expected_deadline_ns = completion.deadline_ns;
+    fault.actual_completion_ns = now;
+    bpf_ringbuf_output(&fault_ringbuf, &fault, sizeof(fault), 0);
+    return 0;
 }
 
 SEC("struct_ops.s/init")

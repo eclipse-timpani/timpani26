@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -381,6 +382,11 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
             next_ts.tv_sec = target_ns / 1000000000ULL;
             next_ts.tv_nsec = target_ns % 1000000000ULL;
 
+            /* Kernel TAI - UTC seconds; read before sleeping to keep it off the release path. */
+            struct timex tx = {};
+            adjtimex(&tx);
+            const long long tai_offset_ns = tx.tai * 1000000000LL;
+
             clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &next_ts, nullptr);
 
             struct timespec wakeup_ts;
@@ -389,6 +395,10 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
             long long actual_ns =
                 (long long)wakeup_ts.tv_sec * 1000000000LL + wakeup_ts.tv_nsec;
             long long jitter = actual_ns - (long long)target_ns;
+
+            const int64_t planned_deadline_ns = static_cast<int64_t>(target_ns) +
+                                               tai_offset_ns +
+                                               slot.deadline_us * 1000LL;
 
             bpf_loader_.update_current_slot(slot.cpu, slot.slot_idx);
 
@@ -453,7 +463,7 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
                 jitters.reserve(1500);
             }
 
-            wake_task(slot.task_id_hash);
+            wake_task(slot.task_id_hash, planned_deadline_ns > 0 ? planned_deadline_ns : 1);
 
             next_slot_idx++;
             if (next_slot_idx >= cpu_slots.size()) {
@@ -466,22 +476,30 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
     std::cout << "[TimerMaster:CPU" << cpu << "] Thread exiting" << std::endl;
 }
 
-void TimerMaster::wake_task(uint64_t task_id_hash)
+void TimerMaster::wake_task(uint64_t task_id_hash, uint64_t deadline_ns)
 {
     if (!ttsched_shm_) return;
 
     /* Read the task-to-SHM mapping under schedule_mutex_ so this wake-up path
      * stays consistent with set_schedule_table()/remove_workload() updates. */
     std::lock_guard<std::mutex> lock(schedule_mutex_);
+    // Known race (#60): an old-table thread can still publish into a new generation.
 
     auto it = task_hash_to_shm_idx_.find(task_id_hash);
     if (it == task_hash_to_shm_idx_.end()) return;
 
     int idx = it->second;
-    /* Increment per-task counter and wake exactly 1 waiter */
-    __atomic_fetch_add(const_cast<uint32_t*>(&ttsched_shm_->tasks[idx].counter),
-                       1u, __ATOMIC_SEQ_CST);
-    syscall(SYS_futex, const_cast<uint32_t*>(&ttsched_shm_->tasks[idx].counter),
+    auto& release = ttsched_shm_->releases[idx];
+    auto* counter = &ttsched_shm_->tasks[idx].counter;
+    const uint32_t next_counter = __atomic_load_n(counter, __ATOMIC_RELAXED) + 1u;
+    /* An odd version left by a killed node must not block later publications. */
+    const uint32_t base_version = __atomic_load_n(&release.version, __ATOMIC_RELAXED) & ~1u;
+    __atomic_store_n(&release.version, base_version + 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release.counter, next_counter, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release.deadline_ns, deadline_ns, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release.version, base_version + 2u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(counter, next_counter, __ATOMIC_RELEASE);
+    syscall(SYS_futex, const_cast<uint32_t*>(counter),
             FUTEX_WAKE, 1, /* wake only the ONE task waiting on this counter */
             nullptr, nullptr, 0);
 }

@@ -212,7 +212,8 @@ if(CONFIG_TRACE_BPF)
     include_directories(${CMAKE_BINARY_DIR}/libbpf/usr/include)
 
     # Build sched_ext BPF scheduler (timpani.bpf.c)
-    ADD_BPF(src/bpf_loader.cpp src/bpf/timpani.bpf.c timpani.bpf.o timpani.skel.h)
+    ADD_BPF(src/bpf_loader.cpp src/bpf/timpani.bpf.c timpani.bpf.o timpani.skel.h
+        "${CMAKE_SOURCE_DIR}/../sample-apps/src/tt_completion.h")
 
     if(TIMPANI_ENABLE_GPDATA)
         message(STATUS "CONFIG_TRACE_BPF_EVENT is ON - Building schedstat BPF tracer")

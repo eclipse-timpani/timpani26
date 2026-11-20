@@ -23,6 +23,12 @@ struct timpani_task_slot {
     uint32_t _pad;
 };
 
+struct timpani_tt_release {
+    uint32_t version;
+    uint32_t counter;
+    uint64_t deadline_ns; /* planned absolute deadline, CLOCK_TAI */
+};
+
 /**
  * Full layout of /timpani_ttsched SHM object.
  * Written by timpani-n TimerMaster (O_RDWR).
@@ -35,6 +41,7 @@ struct timpani_ttsched_shm {
     uint32_t generation; /* monotonically incremented on schedule update */
     uint32_t _pad;
     struct timpani_task_slot tasks[TIMPANI_MAX_TASKS];
+    struct timpani_tt_release releases[TIMPANI_MAX_TASKS];
 };
 
 /* ---- API ---- */

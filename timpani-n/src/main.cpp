@@ -779,6 +779,7 @@ int main(int argc, char** argv)
                         entry.task_name =
                             tt_slot.task_id(); /* comm name, e.g. "task_1" */
                         entry.workload_id_hash = tt_slot.workload_id_hash();
+                        if (tt_slot.deadline_us() > 0) entry.deadline_us = tt_slot.deadline_us();
                         slots.push_back(entry);
 
                         // Populate BPF tt_table_map so dispatch() can consume

@@ -32,6 +32,7 @@ class TimerMaster
         uint64_t    task_id_hash;
         uint64_t    workload_id_hash;
         std::string task_name;   /* task comm name — used for targeted wake */
+        uint32_t    deadline_us = 10000;
     };
 
     TimerMaster(BpfLoader& bpf_loader);
@@ -52,7 +53,7 @@ class TimerMaster
                          uint64_t hyperperiod_ns,
                          uint64_t epoch_ns);
 
-    void wake_task(uint64_t task_id_hash);  /* targeted wake: only this task's slot */
+    void wake_task(uint64_t task_id_hash, uint64_t deadline_ns);
 
     /* Compute next TT start time for a given CPU's slot list */
     static uint64_t compute_next_tt_start_for_cpu(

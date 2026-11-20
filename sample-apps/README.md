@@ -39,6 +39,30 @@ podman run -d --privileged --pid=host --ipc=host --name task_A \
   -p 10 -d 9 -a 3 -l 2000 --bpf -s task_A
 ```
 
+### TT Deadline Reporting Upgrade
+
+TT deadline misses are measured from the planned slot start, even when the
+TimerMaster releases a task late. After each released job, call the existing
+`ttsched_wait_next_period()` to mark completion and wait for another release.
+Ordinary blocking calls do not mark completion.
+
+A miss is judged when the job completes, not when its deadline expires. A job
+that never returns to `ttsched_wait_next_period()` is not reported. Detecting
+expired deadlines independently of completion is tracked in
+[#59](https://github.com/eclipse-timpani/timpani26/issues/59), which will also
+replace the internal completion marker used by this release.
+
+TT deadlines and completion times use `CLOCK_TAI`, so they stay comparable
+across nodes once PTP sets the kernel TAI offset. With NTP only, the offset is
+usually 0 and `CLOCK_TAI` equals `CLOCK_REALTIME`. Applications do not need to
+read `CLOCK_TAI`; use `CLOCK_MONOTONIC` for their own timeouts and durations.
+
+Deploy `timpani-n` and `libttsched` from the same release. For dynamically linked
+apps, replace `libttsched.so` and restart the app; recompiling the app is not
+required. Rebuild and redeploy apps that include `libttsched` statically. Rebuild
+the container image when it bundles the library. Apps using an older library can
+still receive slots, but do not report TT job completion to the updated node.
+
 ### Native Build
 
 ```bash

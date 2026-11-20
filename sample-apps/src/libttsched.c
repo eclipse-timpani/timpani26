@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "libttsched.h"
+#include "tt_completion.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -11,12 +12,24 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 static __thread volatile struct timpani_ttsched_shm* g_shm = NULL;
 static __thread int g_task_idx = -1; /* index into g_shm->tasks[], -1 = not found yet */
 static __thread uint32_t g_shm_generation = 0;
+static __thread int g_has_releases;
+static __thread struct timpani_tt_completion g_job;
+
+_Static_assert(TIMPANI_TT_COMPLETE_OP == (FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG),
+               "TT completion must use a private futex wake");
+
+static int schedule_is_current(void)
+{
+    return __atomic_load_n(&g_shm->magic, __ATOMIC_ACQUIRE) == TIMPANI_TTSCHED_MAGIC &&
+           __atomic_load_n(&g_shm->generation, __ATOMIC_ACQUIRE) == g_shm_generation;
+}
 
 static int find_task_slot(volatile struct timpani_ttsched_shm* shm,
                           const char* name)
@@ -38,6 +51,8 @@ void ttsched_init(void)
     int fd = shm_open("/timpani_ttsched", O_RDONLY, 0666);
     if (fd < 0) return;
 
+    struct stat status;
+    g_has_releases = fstat(fd, &status) == 0 && status.st_size >= (off_t)sizeof(*g_shm);
     g_shm = (volatile struct timpani_ttsched_shm*)mmap(
         NULL, sizeof(struct timpani_ttsched_shm), PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
@@ -57,6 +72,12 @@ void ttsched_init(void)
 int ttsched_wait_next_period(void)
 {
     uint32_t current;
+
+    if (g_job.deadline_ns) {
+        syscall(SYS_futex, &g_job, TIMPANI_TT_COMPLETE_OP, 1, NULL, NULL,
+                TIMPANI_TT_COMPLETE_BITSET);
+        g_job.deadline_ns = 0;
+    }
 
     if (!g_shm) {
         /* SHM not mapped yet — retry open/map on every call */
@@ -104,30 +125,28 @@ int ttsched_wait_next_period(void)
         }
     }
 
-    current = g_shm->tasks[g_task_idx].counter;
-    /*
-     * FUTEX_WAIT on this task's own counter word.
-     *
-     * Return cases:
-     *   0      — woken by TimerMaster FUTEX_WAKE: slot fired, proceed.
-     *   EAGAIN — counter already changed before we slept (slot fired just
-     *            before the syscall): proceed normally, no sleep needed.
-     *   EINTR  — interrupted by a signal (spurious wakeup): re-check and
-     *            go back to sleep.  Do NOT let the task run early.
-     */
-    while (syscall(SYS_futex, (uint32_t*)&g_shm->tasks[g_task_idx].counter,
-                   FUTEX_WAIT, current, NULL, NULL, 0) == -1 &&
-           errno ==
-               EINTR); /* re-enter FUTEX_WAIT until genuinely woken or EAGAIN */
+    volatile uint32_t* counter = &g_shm->tasks[g_task_idx].counter;
+    current = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (!schedule_is_current()) return -1;
+        uint32_t observed = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+        if (!schedule_is_current()) return -1;
+        if (observed != current) {
+            if (!g_has_releases) return 0;
 
-    /* After wakeup: check if TimerMaster zeroed magic (shutdown signal).
-     * If so, invalidate our mapping so the next call triggers re-init. */
-    if (g_shm->magic != TIMPANI_TTSCHED_MAGIC) {
-        munmap((void*)g_shm, sizeof(struct timpani_ttsched_shm));
-        g_shm = NULL;
-        g_task_idx = -1;
-        return -1;
+            const volatile struct timpani_tt_release* release = &g_shm->releases[g_task_idx];
+            uint32_t version = __atomic_load_n(&release->version, __ATOMIC_SEQ_CST);
+            uint32_t job_counter = __atomic_load_n(&release->counter, __ATOMIC_SEQ_CST);
+            uint64_t deadline = __atomic_load_n(&release->deadline_ns, __ATOMIC_SEQ_CST);
+            if (!schedule_is_current()) return -1;
+            if (!(version & 1u) && job_counter == observed &&
+                version == __atomic_load_n(&release->version, __ATOMIC_SEQ_CST)) {
+                g_job.deadline_ns = deadline;
+                return 0;
+            }
+        }
+        if (syscall(SYS_futex, (uint32_t*)counter, FUTEX_WAIT, observed,
+                    NULL, NULL, 0) == -1 && errno != EINTR && errno != EAGAIN)
+            return -1;
     }
-
-    return 0;
 }
