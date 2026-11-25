@@ -203,6 +203,7 @@ add_executable(test_recovery_service
     test_recovery_service.cpp
     ../src/recovery_service.cpp
     ../src/schedinfo_service.cpp
+    ../src/phase0_runtime.cpp
     ../src/node_config.cpp
     ../src/global_scheduler.cpp
     ../src/orchestrator_service.cpp

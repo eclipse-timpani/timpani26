@@ -324,6 +324,9 @@ TEST(Phase0Context, BuildsOrderedRtSlotsAndTheTtFreeOffset)
     const uint32_t shm_idx[] = {0, 1, 2, 0};
     for (size_t i = 0; i < ctx.slots.size(); ++i) {
         EXPECT_EQ(ctx.slots[i].offset_ns, offsets[i]);
+        EXPECT_EQ(ctx.slots[i].deadline_ns,
+                  static_cast<uint64_t>(prepared.slots[i].deadline_us) *
+                      1000ULL);
         EXPECT_EQ(ctx.slots[i].shm_idx, shm_idx[i]);
         EXPECT_EQ(ctx.slots[i].slot_idx, i);
         EXPECT_EQ(ctx.slots[i].cpu, kCpu);

@@ -328,7 +328,9 @@ bool BpfLoader::stage_table(const phase0::NPrepared& prepared) {
     int shadow = get_shadow_map_idx();
     // The shadow bank must have no in-flight BPF references before it is
     // cleared; otherwise a running callback could read a half-written bank.
-    if (skel_->bss->kernel_control.bank_active_refs[shadow] != 0) {
+    if (__atomic_load_n(
+            &skel_->bss->kernel_control.bank_active_refs[shadow],
+            __ATOMIC_ACQUIRE) != 0) {
         return false;
     }
     if (!clear_bank(shadow)) return false;
@@ -403,9 +405,8 @@ void BpfLoader::apply_table_update() {
     if (!skel_) return;
     int old = active_map_idx_;
     swap_shadow_maps();
-    // Single handover step in kernel .bss: raise the gate, flip the active
-    // bank, release the gate. BPF callbacks read the bank once per callback,
-    // so the flip is atomic with respect to them.
+    // Single handover step in kernel .bss. Callback-wide references pin and
+    // revalidate their selected bank before any lookup.
     apply_handover(&skel_->bss->kernel_control, active_map_idx_);
     cleanup_old_bank(old);
 }
@@ -414,7 +415,9 @@ void BpfLoader::cleanup_old_bank(int old_bank) {
     if (!skel_) return;
     old_bank = clamp_bank(old_bank);
     // Only clean once no BPF callback still references the old bank.
-    if (skel_->bss->kernel_control.bank_active_refs[old_bank] == 0) {
+    if (__atomic_load_n(
+            &skel_->bss->kernel_control.bank_active_refs[old_bank],
+            __ATOMIC_ACQUIRE) == 0) {
         clear_bank(old_bank);
     }
 }

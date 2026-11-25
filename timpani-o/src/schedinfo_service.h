@@ -72,11 +72,16 @@ class SchedInfoServiceImpl final : public SchedInfoService::Service
         Phase0Workloads workloads;
         Phase0Table table;
     };
+    struct OAttemptCompletion {
+        bool completed = false;
+        bool success = false;
+    };
     struct OAttempt {
         OConfirmed candidate;
         Phase0Operation operation;
         std::string targets;
         bool sent = false;
+        std::shared_ptr<OAttemptCompletion> completion;
     };
     struct Phase0State {
         std::mutex mutex;
@@ -93,9 +98,10 @@ class SchedInfoServiceImpl final : public SchedInfoService::Service
     };
     std::shared_ptr<Phase0State> phase0_;
 
-    bool SubmitPhase0Update(Phase0Operation operation,
-                            const std::vector<SchedInfo>& inputs,
-                            const std::vector<std::string>& removals = {});
+    bool SubmitPhase0Update(
+        Phase0Operation operation, const std::vector<SchedInfo>& inputs,
+        const std::vector<std::string>& removals = {},
+        std::shared_ptr<OAttemptCompletion> completion = nullptr);
     bool PreparePhase0Candidate(Phase0Operation operation,
                                 const std::vector<SchedInfo>& inputs,
                                 const std::vector<std::string>& removals,

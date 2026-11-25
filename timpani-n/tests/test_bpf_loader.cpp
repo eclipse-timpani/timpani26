@@ -178,11 +178,11 @@ TEST(BpfLoaderStageTest, MissingFunctionPointerIsRejected)
 
 TEST(BpfLoaderKernelControlTest, LayoutMatchesBpfBss)
 {
-    EXPECT_EQ(sizeof(KernelControl), 16u);
+    EXPECT_EQ(sizeof(KernelControl), 24u);
     EXPECT_EQ(offsetof(KernelControl, active_bank_idx), 0u);
     EXPECT_EQ(offsetof(KernelControl, tt_handover_gate), 4u);
     EXPECT_EQ(offsetof(KernelControl, bank_active_refs), 8u);
-    EXPECT_EQ(sizeof(KernelControl::bank_active_refs), 8u);
+    EXPECT_EQ(sizeof(KernelControl::bank_active_refs), 16u);
 }
 
 }  // namespace

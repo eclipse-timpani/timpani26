@@ -39,6 +39,23 @@ public:
         std::lock_guard<std::mutex> lock(service.phase0_->mutex);
         return service.phase0_->stopped;
     }
+    static void SettleAndInstallUnrelatedAttempt(SchedInfoServiceImpl& service) {
+        std::lock_guard<std::mutex> lock(service.phase0_->mutex);
+        ASSERT_TRUE(service.phase0_->attempt);
+        ASSERT_TRUE(service.phase0_->attempt->completion);
+        service.phase0_->confirmed = service.phase0_->attempt->candidate;
+        service.phase0_->attempt->completion->completed = true;
+        service.phase0_->attempt->completion->success = true;
+        service.phase0_->attempt.reset();
+
+        SchedInfoServiceImpl::OAttempt unrelated;
+        unrelated.candidate = *service.phase0_->confirmed;
+        unrelated.operation = SchedInfoServiceImpl::Phase0Operation::Add;
+        unrelated.targets = "unrelated";
+        unrelated.sent = false;
+        service.phase0_->attempt = std::move(unrelated);
+        service.phase0_->settled.notify_all();
+    }
     static std::map<std::string, std::string> ConfirmedInputs(SchedInfoServiceImpl& service) {
         std::lock_guard<std::mutex> lock(service.phase0_->mutex);
         std::map<std::string, std::string> result;
@@ -310,19 +327,51 @@ TEST_F(Phase0Test, ExistingModificationDoesNotLoseOriginalInput)
     EXPECT_EQ(slots(Send(), "W1"), slots(Confirmed(), "W1"));
 }
 
-TEST_F(Phase0Test, RejectsHyperperiodGrowthAndShrinkWithoutOverwritingH)
+TEST_F(Phase0Test, ExpandsDivisorHyperperiodWithoutOverwritingConfirmedGrid)
 {
     Seed();
     const auto before = Confirmed().SerializeAsString();
-    EXPECT_EQ(Add(workload("long", "long_task", 40000, 100, 40000)), -1);
-    EXPECT_FALSE(Phase0TestPeer::Replace(
-        Service(), {workload("short", "short_task", 10000, 100, 10000)}));
+    const auto longer = workload("long", "long_task", 40000, 100, 40000);
+    const auto shorter = workload("short", "short_task", 10000, 100, 10000);
+    EXPECT_EQ(Add(longer), -1);
     EXPECT_EQ(Confirmed().SerializeAsString(), before);
+    ASSERT_TRUE(Phase0TestPeer::Replace(Service(), {shorter}));
+    const auto replaced = Send();
+    EXPECT_EQ(replaced.hyperperiod_us(), 20000u);
+    EXPECT_EQ(slots(replaced, "short"), (std::vector<Slot>{
+        {"short_task", 0, 100, 10000, 2},
+        {"short_task", 10000, 100, 10000, 2}}));
+    Ack(replaced);
     ASSERT_TRUE(Phase0TestPeer::Clear(Service()));
     Ack(Send());
-    EXPECT_EQ(Add(workload("short", "short_task", 10000, 100, 10000)), -1);
-    ASSERT_EQ(Add(w1()), 0);
-    EXPECT_EQ(slots(Send(), "W1").size(), 3u);
+    ASSERT_EQ(Add(shorter), 0);
+    const auto restored = Send();
+    EXPECT_EQ(restored.hyperperiod_us(), 20000u);
+    EXPECT_EQ(slots(restored, "short"), slots(replaced, "short"));
+}
+
+TEST_F(Phase0Test, RemoveAndClearExpandSmallerMinimumCyclesOverConfirmedFrame)
+{
+    const auto short_task = workload("short", "short_task", 20000, 100, 20000);
+    const auto long_task = workload("long", "long_task", 40000, 100, 40000);
+    ASSERT_TRUE(Phase0TestPeer::Replace(Service(), {short_task, long_task}));
+    const auto baseline = Send();
+    ASSERT_EQ(baseline.hyperperiod_us(), 40000u);
+    ASSERT_EQ(slots(baseline, "short").size(), 2u);
+    Ack(baseline);
+
+    ASSERT_TRUE(server_->RemoveWorkload("long"));
+    const auto removed = Send();
+    EXPECT_EQ(removed.hyperperiod_us(), 40000u);
+    EXPECT_EQ(slots(removed, "short"), slots(baseline, "short"));
+    Ack(removed);
+
+    ASSERT_TRUE(Phase0TestPeer::Clear(Service()));
+    Ack(Send());
+    ASSERT_EQ(Add(short_task), 0);
+    const auto restored = Send();
+    EXPECT_EQ(restored.hyperperiod_us(), 40000u);
+    EXPECT_EQ(slots(restored, "short"), slots(baseline, "short"));
 }
 
 TEST_F(Phase0Test, RejectsAddAndRemoveThatMoveRetainedSlots)
@@ -596,6 +645,19 @@ TEST_F(Phase0Test, RecoveryStopRepliesAfterCorrelatedRemoveAck)
     EXPECT_EQ(Confirmed().SerializeAsString(), removed.SerializeAsString());
     EXPECT_FALSE(Phase0TestPeer::Stopped(Service()));
     EXPECT_EQ(Add(w3()), 0);
+}
+
+TEST_F(Phase0Test, RecoveryStopIgnoresAnUnrelatedLaterAttempt)
+{
+    Seed();
+    auto stop = std::async(std::launch::async, [&] {
+        return server_->RemoveWorkload("W2", nullptr, false);
+    });
+    ASSERT_TRUE(wait_until([&] { return Phase0TestPeer::Pending(Service()); }));
+    Phase0TestPeer::SettleAndInstallUnrelatedAttempt(Service());
+    EXPECT_TRUE(stop.get());
+    EXPECT_TRUE(Phase0TestPeer::Pending(Service()));
+    EXPECT_FALSE(Phase0TestPeer::Stopped(Service()));
 }
 
 TEST_F(Phase0Test, RecoveryStopFailsWithoutConfirmedRemoval)

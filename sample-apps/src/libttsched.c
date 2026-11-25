@@ -14,9 +14,12 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ttsched_shm.h"
+
+#define TTSCHED_WAIT_RECHECK_NS 100000000L
 
 static __thread volatile struct timpani_ttsched_shm* g_shm = NULL;
 static __thread char g_name[TTSCHED_NAME_LEN]; /* PR_GET_NAME of this thread */
@@ -66,13 +69,18 @@ void ttsched_init(void)
 static int wait_counter(const volatile uint32_t* word, uint32_t expected,
                         void* ctx)
 {
+    static const struct timespec recheck = {
+        .tv_sec = 0,
+        .tv_nsec = TTSCHED_WAIT_RECHECK_NS,
+    };
+
     (void)ctx;
-    if (syscall(SYS_futex, (uint32_t*)word, FUTEX_WAIT, expected, NULL, NULL,
-                0) == 0)
+    if (syscall(SYS_futex, (uint32_t*)word, FUTEX_WAIT, expected, &recheck,
+                NULL, 0) == 0)
         return 0;
-    /* EAGAIN: the counter already changed. EINTR: a signal. Both are
-     * re-checked against the publication before any job is reported. */
-    return errno == EAGAIN || errno == EINTR ? 0 : -1;
+    /* EAGAIN means the counter changed, EINTR is a signal and ETIMEDOUT is
+     * the periodic publication/mapping re-check. None is a job by itself. */
+    return errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT ? 0 : -1;
 }
 
 static int load_release_deadline(const struct ttsched_snapshot* snap,

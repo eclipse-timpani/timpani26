@@ -61,6 +61,10 @@ class Phase0RtPort final : public phase0::RtPlatform
                  ::KernelControl* control)
         : bpf_(bpf), shm_(shm), control_(control)
     {
+        struct timex tx = {};
+        if (adjtimex(&tx) >= 0) {
+            tai_offset_ns_ = static_cast<int64_t>(tx.tai) * 1000000000LL;
+        }
     }
 
     uint64_t now_ns() override { return clock_ns(CLOCK_REALTIME); }
@@ -75,9 +79,11 @@ class Phase0RtPort final : public phase0::RtPlatform
                 clock_ns(CLOCK_MONOTONIC) + (next_start_ns - target_ns));
         }
         if (!shm_) return;
+        const uint64_t deadline_ns =
+            target_ns + tai_offset_ns_ + slot.deadline_ns;
+        ttsched_shm_publish_release(shm_, slot.shm_idx, deadline_ns);
         uint32_t* counter =
             const_cast<uint32_t*>(&shm_->tasks[slot.shm_idx].counter);
-        __atomic_fetch_add(counter, 1u, __ATOMIC_SEQ_CST);
         syscall(SYS_futex, counter, FUTEX_WAKE, 1, nullptr, nullptr, 0);
     }
 
@@ -92,6 +98,7 @@ class Phase0RtPort final : public phase0::RtPlatform
     BpfLoader& bpf_;
     volatile struct timpani_ttsched_shm* shm_;
     ::KernelControl* control_;
+    uint64_t tai_offset_ns_ = 0;
 };
 
 // DDR-011 Phase 0 handover coordinator: non-RT kernel operations.
@@ -643,17 +650,10 @@ void TimerMaster::wake_task(uint64_t task_id_hash, uint64_t deadline_ns)
     auto it = task_hash_to_shm_idx_.find(task_id_hash);
     if (it == task_hash_to_shm_idx_.end()) return;
 
-    int idx = it->second;
-    auto& release = ttsched_shm_->releases[idx];
+    const int idx = it->second;
+    ttsched_shm_publish_release(ttsched_shm_, static_cast<uint32_t>(idx),
+                                deadline_ns);
     auto* counter = &ttsched_shm_->tasks[idx].counter;
-    const uint32_t next_counter = __atomic_load_n(counter, __ATOMIC_RELAXED) + 1u;
-    /* An odd version left by a killed node must not block later publications. */
-    const uint32_t base_version = __atomic_load_n(&release.version, __ATOMIC_RELAXED) & ~1u;
-    __atomic_store_n(&release.version, base_version + 1u, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&release.counter, next_counter, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&release.deadline_ns, deadline_ns, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&release.version, base_version + 2u, __ATOMIC_SEQ_CST);
-    __atomic_store_n(counter, next_counter, __ATOMIC_RELEASE);
     syscall(SYS_futex, const_cast<uint32_t*>(counter),
             FUTEX_WAKE, 1, /* wake only the ONE task waiting on this counter */
             nullptr, nullptr, 0);

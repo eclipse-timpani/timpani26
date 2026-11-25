@@ -67,6 +67,7 @@ bool build_context(const NPrepared& prepared, uint64_t token, Context& out,
         RtSlot rt;
         rt.offset_ns = slot.offset_ns;
         rt.end_ns = slot.offset_ns + slot.duration_ns;
+        rt.deadline_ns = static_cast<uint64_t>(slot.deadline_us) * 1000ULL;
         rt.task_id_hash = slot.task_id_hash;
         rt.cpu = slot.cpu;
         rt.slot_idx = slot.slot_idx;

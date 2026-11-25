@@ -202,6 +202,22 @@ TEST_F(TtschedShmTest, PublicationLeavesCountersUntouched)
     EXPECT_EQ(counter(5), 3u);
 }
 
+TEST_F(TtschedShmTest, ReleaseRecordIsStableBeforeTheCounterAdvances)
+{
+    raw_.tasks[2].counter = 40;
+    EXPECT_EQ(ttsched_shm_publish_release(shm(), 2, 123456789u), 41u);
+    EXPECT_EQ(raw_.releases[2].version, 2u);
+    EXPECT_EQ(raw_.releases[2].counter, 41u);
+    EXPECT_EQ(raw_.releases[2].deadline_ns, 123456789u);
+    EXPECT_EQ(counter(2), 41u);
+
+    EXPECT_EQ(ttsched_shm_publish_release(shm(), 2, 987654321u), 42u);
+    EXPECT_EQ(raw_.releases[2].version, 4u);
+    EXPECT_EQ(raw_.releases[2].counter, 42u);
+    EXPECT_EQ(raw_.releases[2].deadline_ns, 987654321u);
+    EXPECT_EQ(counter(2), 42u);
+}
+
 TEST_F(TtschedShmTest, StoreNameTruncatesAndClearsTheRest)
 {
     ttsched_shm_store_name(shm(), 3, "abcdefghijklmnopqrstuvwxyz");

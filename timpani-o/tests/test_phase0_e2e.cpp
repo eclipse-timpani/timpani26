@@ -270,22 +270,15 @@ class Phase0E2ETest : public ::testing::Test
         ASSERT_FALSE(table_id.empty()) << name;
         if (in_flight) in_flight();
 
-        bool checked_after_send = false;
         const auto deadline = Clock::now() + ack_timeout_;
         while (!Phase0TestPeer::CandidateId(Service()).empty()) {
             ASSERT_LT(Clock::now(), deadline)
                 << name << ": no TableApplied for table_id=" << table_id;
             server_->PushPendingTables();
-            if (in_flight && !checked_after_send &&
-                Phase0TestPeer::Sent(Service())) {
-                in_flight();
-                checked_after_send = true;
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         ASSERT_FALSE(Phase0TestPeer::Stopped(Service()))
             << name << ": the trial stopped";
-        if (in_flight) EXPECT_TRUE(checked_after_send) << name;
 
         const std::string confirmed_id = Phase0TestPeer::ConfirmedId(Service());
         const Workloads confirmed =

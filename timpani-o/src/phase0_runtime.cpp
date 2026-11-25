@@ -60,6 +60,67 @@ bool same_parameters(const SchedInfo& left, const SchedInfo& right)
     return left.temporal_class() == right.temporal_class() && a == b;
 }
 
+bool expand_phase0_table(
+    timpani::node::v1::HierarchicalScheduleTable& table,
+    uint32_t execution_frame_us, std::string& error)
+{
+    const uint32_t minimum_cycle_us = table.hyperperiod_us();
+    if (minimum_cycle_us == 0 || execution_frame_us == 0 ||
+        execution_frame_us % minimum_cycle_us != 0) {
+        error = "generated hyperperiod does not divide the confirmed grid";
+        return false;
+    }
+
+    const uint32_t repeats = execution_frame_us / minimum_cycle_us;
+    size_t expanded_slots = 0;
+    for (const auto& partition : table.partitions()) {
+        for (const auto& layer : partition.layers()) {
+            const size_t slots = static_cast<size_t>(layer.tt_slots_size());
+            if (slots > kMaxTtSlots / repeats ||
+                expanded_slots > kMaxTtSlots - slots * repeats) {
+                error = "expanded TT slot capacity exceeds 2048";
+                return false;
+            }
+            expanded_slots += slots * repeats;
+        }
+    }
+    if (repeats == 1) return true;
+
+    for (auto& partition : *table.mutable_partitions()) {
+        for (auto& layer : *partition.mutable_layers()) {
+            std::vector<timpani::node::v1::TtSlot> expanded;
+            expanded.reserve(static_cast<size_t>(layer.tt_slots_size()) * repeats);
+            for (const auto& original : layer.tt_slots()) {
+                for (uint32_t repeat = 0; repeat < repeats; ++repeat) {
+                    auto slot = original;
+                    const uint64_t offset = static_cast<uint64_t>(repeat) *
+                                                minimum_cycle_us +
+                                            original.offset_us();
+                    if (offset > std::numeric_limits<uint32_t>::max()) {
+                        error = "expanded slot offset exceeds uint32";
+                        return false;
+                    }
+                    slot.set_offset_us(static_cast<uint32_t>(offset));
+                    expanded.push_back(std::move(slot));
+                }
+            }
+            std::sort(expanded.begin(), expanded.end(),
+                      [](const auto& left, const auto& right) {
+                          return std::tuple(left.offset_us(), left.cpu(),
+                                            left.workload_id(), left.task_id()) <
+                                 std::tuple(right.offset_us(), right.cpu(),
+                                            right.workload_id(), right.task_id());
+                      });
+            layer.clear_tt_slots();
+            for (auto& slot : expanded) {
+                *layer.add_tt_slots() = std::move(slot);
+            }
+        }
+    }
+    table.set_hyperperiod_us(execution_frame_us);
+    return true;
+}
+
 } // namespace
 
 bool SchedInfoServer::EnablePhase0(timpani::orchestrator::OrchestratorServiceImpl& orchestrator)
@@ -312,8 +373,10 @@ bool SchedInfoServiceImpl::PreparePhase0Candidate(
             return false;
         }
         table = std::move(std::get<Phase0Table>(result));
-        if (state.confirmed && table.hyperperiod_us() != state.confirmed->table.hyperperiod_us()) {
-            error = "generated hyperperiod differs from the confirmed grid";
+        if (state.confirmed &&
+            !expand_phase0_table(table,
+                                 state.confirmed->table.hyperperiod_us(),
+                                 error)) {
             return false;
         }
     }
@@ -342,7 +405,8 @@ bool SchedInfoServiceImpl::PreparePhase0Candidate(
 
 bool SchedInfoServiceImpl::SubmitPhase0Update(
     Phase0Operation operation, const std::vector<SchedInfo>& inputs,
-    const std::vector<std::string>& removals)
+    const std::vector<std::string>& removals,
+    std::shared_ptr<OAttemptCompletion> completion)
 {
     auto& state = *phase0_;
     std::unique_lock<std::mutex> lock(state.mutex, std::try_to_lock);
@@ -362,6 +426,7 @@ bool SchedInfoServiceImpl::SubmitPhase0Update(
                   " result=rejected reason=", error);
         return false;
     }
+    candidate.completion = std::move(completion);
     state.attempt = std::move(candidate);
     TLOG_INFO("[RTU-P0] node_id=", state.node_id,
               " table_id=", state.attempt->candidate.table.table_id(),
@@ -393,6 +458,10 @@ void SchedInfoServiceImpl::HandlePhase0Ack(
         }
         state.confirmed = std::move(state.attempt->candidate);
         state.changed = true;
+    }
+    if (state.attempt->completion) {
+        state.attempt->completion->completed = true;
+        state.attempt->completion->success = applied.success();
     }
     state.attempt.reset();
     state.settled.notify_all();
@@ -446,16 +515,20 @@ bool SchedInfoServiceImpl::RemovePhase0Workload(
         return false;
     }
     if (resolved_id) *resolved_id = actual_id;
-    if (!SubmitPhase0Update(Phase0Operation::Remove, {}, {actual_id})) return false;
+    auto completion =
+        trigger_push ? nullptr : std::make_shared<OAttemptCompletion>();
+    if (!SubmitPhase0Update(Phase0Operation::Remove, {}, {actual_id},
+                           completion)) {
+        return false;
+    }
     if (trigger_push) return true;
-    // Recovery STOP (DDR-011 v2.4): reply only after the correlated TableApplied.
-    // One attempt is in flight at a time, so the staged REMOVE settles first.
     std::unique_lock<std::mutex> lock(state.mutex);
-    const bool settled = state.settled.wait_for(lock, kRecoveryStopAckTimeout, [&state] {
-        return state.stopped || !state.attempt;
-    });
-    const bool removed = settled && !state.stopped && state.confirmed &&
-        state.confirmed->workloads.count(actual_id) == 0;
+    const bool settled = state.settled.wait_for(
+        lock, kRecoveryStopAckTimeout, [&state, &completion] {
+            return state.stopped || completion->completed;
+        });
+    const bool removed = settled && !state.stopped && completion->completed &&
+                         completion->success;
     const char* reply = removed ? "confirmed" : settled ? "failed" : "timeout";
     if (removed) {
         TLOG_INFO("[RTU-P0] node_id=", state.node_id, " recovery=STOP target_workloads=",

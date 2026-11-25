@@ -69,6 +69,27 @@ static inline void ttsched_shm_store_counter(
     __atomic_store_n(&shm->tasks[idx].counter, value, __ATOMIC_RELAXED);
 }
 
+static inline uint32_t ttsched_shm_publish_release(
+    volatile struct timpani_ttsched_shm* shm, uint32_t idx,
+    uint64_t deadline_ns)
+{
+    volatile struct timpani_tt_release* release = &shm->releases[idx];
+    uint32_t* counter = (uint32_t*)&shm->tasks[idx].counter;
+    const uint32_t next_counter =
+        __atomic_load_n(counter, __ATOMIC_RELAXED) + 1u;
+    const uint32_t base_version =
+        __atomic_load_n(&release->version, __ATOMIC_RELAXED) & ~1u;
+
+    __atomic_store_n(&release->version, base_version + 1u,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release->counter, next_counter, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release->deadline_ns, deadline_ns, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release->version, base_version + 2u,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(counter, next_counter, __ATOMIC_RELEASE);
+    return next_counter;
+}
+
 static inline void ttsched_shm_store_n_tasks(
     volatile struct timpani_ttsched_shm* shm, uint32_t n_tasks)
 {
