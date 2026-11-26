@@ -273,9 +273,7 @@ to `TIMPANI_P0_E2E_CONNECT_S` (60) seconds for the node and up to
 `TIMPANI_P0_E2E_ACK_TIMEOUT_S` (10) seconds for each ACK. It runs
 `TIMPANI_P0_E2E_ROUNDS` (3) rounds. Start the sample apps and
 `timpani-n --runtime-table-update-phase0` first, and restart timpani-n before
-each run. See §5.4 of the
-[Phase 0 plan](../doc/design/DDR-011-runtime-table-update-phase0/implementation_plan.md)
-for the target procedure and the evidence to collect.
+each run.
 
 timpani-n acknowledges a table only after the boundary switch and the old-state
 cleanup (P0-T06). Host and mock-node results do not prove BPF/SHM activation;

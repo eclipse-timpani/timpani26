@@ -480,6 +480,11 @@ Completion await_completion(HandoverState& state, CoordinatorPort& port,
                 done.error = "handover changed state while awaiting completion";
                 return done;
             }
+            const uint64_t poll_ns = std::max(config.poll_ns, uint64_t{1});
+            const uint64_t max_ns =
+                std::numeric_limits<uint64_t>::max();
+            port.sleep_until(now > max_ns - poll_ns ? max_ns
+                                                   : now + poll_ns);
             continue;
         }
         port.sleep_until(std::min(now + config.poll_ns, deadline));

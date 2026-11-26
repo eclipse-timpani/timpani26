@@ -887,6 +887,62 @@ TEST(Phase0Completion, ConcurrentApplyAtTheDeadlineIsNotOverwritten)
     EXPECT_EQ(state.phase.load(), p0::Phase::kApplied);
 }
 
+class ApplyingCompletionPort final : public ClockOnlyPort
+{
+  public:
+    ApplyingCompletionPort(p0::HandoverState& state, uint64_t deadline)
+        : state_(state), deadline_(deadline)
+    {
+    }
+
+    uint64_t now_ns() override
+    {
+        if (now >= deadline_ && ++deadline_observations >= 4)
+            complete();
+        return now;
+    }
+
+    void sleep_until(uint64_t t) override
+    {
+        now = std::max(now, t);
+        if (now > deadline_) {
+            ++post_deadline_sleeps;
+            complete();
+        }
+    }
+
+    void complete()
+    {
+        state_.done_token.store(23, std::memory_order_relaxed);
+        state_.done_planned_ns.store(kEpoch, std::memory_order_relaxed);
+        state_.done_actual_ns.store(now, std::memory_order_relaxed);
+        state_.phase.store(p0::Phase::kApplied, std::memory_order_release);
+    }
+
+    int deadline_observations = 0;
+    int post_deadline_sleeps = 0;
+
+  private:
+    p0::HandoverState& state_;
+    uint64_t deadline_;
+};
+
+TEST(Phase0Completion, ApplyingWaitSleepsAfterTheDeadline)
+{
+    p0::HandoverState state;
+    state.phase = p0::Phase::kApplying;
+    p0::HandoverConfig config;
+    config.completion_timeout_ns = 5 * kMs;
+    ApplyingCompletionPort port(state,
+                                kEpoch + config.completion_timeout_ns);
+
+    const p0::Completion done =
+        p0::await_completion(state, port, kEpoch, config);
+    EXPECT_TRUE(done.applied);
+    EXPECT_GT(port.post_deadline_sleeps, 0);
+    EXPECT_LT(port.deadline_observations, 4);
+}
+
 // ---------------------------------------------------------------------------
 // Real threads: the coordinator and the RT engine run concurrently.
 // ---------------------------------------------------------------------------
