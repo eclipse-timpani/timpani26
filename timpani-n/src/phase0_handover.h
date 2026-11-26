@@ -88,6 +88,7 @@ enum class Phase : uint32_t {
     kIdle,
     kCommitting,  // gate closing/closed for boundary_ns, not ready yet
     kReady,       // candidate prepared; the RT thread applies it at T
+    kApplying,    // RT owns the apply transition; timeout cannot cancel it
     kApplied,
     kFailed,  // after the point of no return; never restored
 };
@@ -167,7 +168,7 @@ class CoordinatorPort
     // No TT task running or queued on @cpu and no BPF callback holding a
     // reference on the active bank.
     virtual bool tt_idle(uint32_t cpu) = 0;
-    virtual void set_tt_gate(bool closed) = 0;
+    virtual bool set_tt_gate(bool closed) = 0;
     virtual bool select_staged_bank() = 0;  // the gate stays closed
     virtual int active_bank() = 0;
     // current slot = SLOT_NONE, next TT start = @first_start_ns (0: none).

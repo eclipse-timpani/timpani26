@@ -628,7 +628,7 @@ int main(int argc, char* argv[])
      * buffers or we hang on futex */
     setvbuf(stdout, NULL, _IONBF, 0);
     sigset_t sig_set;
-    struct timespec now, before, deadline_time;
+    struct timespec now, before, wall_now, wall_before, deadline_time;
     clockid_t clockid = CLOCK_MONOTONIC;
     int signo = SIGNO_TT;
     int signal_received = -1;
@@ -817,11 +817,16 @@ int main(int argc, char* argv[])
             }
         }
 
-        /* Record start time */
-        clock_gettime(clockid, &before);
+        /* Record start time. Deadlines always use wall-clock time. */
+        clock_gettime(CLOCK_MONOTONIC, &wall_before);
+        if (clockid == CLOCK_MONOTONIC) {
+            before = wall_before;
+        } else {
+            clock_gettime(clockid, &before);
+        }
 
         /* Calculate deadline time */
-        deadline_time = before;
+        deadline_time = wall_before;
         deadline_time.tv_sec += task_config.deadline_ms / 1000;
         deadline_time.tv_nsec +=
             (task_config.deadline_ms % 1000) * NSEC_PER_MSEC;
@@ -834,12 +839,17 @@ int main(int argc, char* argv[])
         do_calculations(loop_cnt);
 
         /* Record end time */
-        clock_gettime(clockid, &now);
+        clock_gettime(CLOCK_MONOTONIC, &wall_now);
+        if (clockid == CLOCK_MONOTONIC) {
+            now = wall_now;
+        } else {
+            clock_gettime(clockid, &now);
+        }
 
         /* Calculate runtime and check deadline */
         unsigned long runtime_us =
             diff(ts_ns(now), ts_ns(before)) / NSEC_PER_USEC;
-        bool deadline_miss = (ts_ns(now) > ts_ns(deadline_time));
+        bool deadline_miss = (ts_ns(wall_now) > ts_ns(deadline_time));
 
         /* Update statistics */
         if (task_config.enable_stats) {

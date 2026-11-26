@@ -185,7 +185,11 @@ class World final : public p0::RtPlatform, public p0::CoordinatorPort
         ++idle_calls;
         return idle_fn ? idle_fn(now) : true;
     }
-    void set_tt_gate(bool closed) override { set_gate(closed); }
+    bool set_tt_gate(bool closed) override
+    {
+        set_gate(closed);
+        return closed || !fail_gate_reopen;
+    }
     bool select_staged_bank() override
     {
         if (select_cost) run_until(now + select_cost);
@@ -221,6 +225,7 @@ class World final : public p0::RtPlatform, public p0::CoordinatorPort
     bool staged = false;
     bool fail_stage = false;
     bool fail_select = false;
+    bool fail_gate_reopen = false;
     uint64_t select_cost = 0;
     int stage_calls = 0;
     int discards = 0;
@@ -555,6 +560,22 @@ TEST_F(HandoverTest, GateRaceRollsBackWithoutTouchingTheShmOrBank)
     EXPECT_EQ(generation(), base + 2);  // one publication for B
 }
 
+TEST_F(HandoverTest, GateRaceDrainFailureStopsTheTrial)
+{
+    install_a();
+    const uint32_t base = generation();
+    int calls = 0;
+    world_.idle_fn = [&calls](uint64_t) { return ++calls != 2; };
+    world_.fail_gate_reopen = true;
+
+    const Outcome out = apply(prepared(kTableB));
+    EXPECT_EQ(out.arm.outcome, p0::ArmOutcome::kFailed);
+    EXPECT_NE(out.arm.error.find("did not drain"), std::string::npos);
+    EXPECT_EQ(world_.state.phase.load(), p0::Phase::kFailed);
+    EXPECT_EQ(world_.selects, 1);
+    EXPECT_EQ(generation(), base);
+}
+
 TEST_F(HandoverTest, NeverQuiescentIsRejectedAfterEightBoundaries)
 {
     const uint64_t t0 = install_a();
@@ -760,7 +781,7 @@ TEST_F(HandoverTest, EngineStopsAfterACoordinatorFailure)
 // Completion wait
 // ---------------------------------------------------------------------------
 
-class ClockOnlyPort final : public p0::CoordinatorPort
+class ClockOnlyPort : public p0::CoordinatorPort
 {
   public:
     uint64_t now_ns() override { return now; }
@@ -768,7 +789,7 @@ class ClockOnlyPort final : public p0::CoordinatorPort
     bool stage_bank(const p0::NPrepared&) override { return true; }
     void discard_staged_bank() override {}
     bool tt_idle(uint32_t) override { return true; }
-    void set_tt_gate(bool) override {}
+    bool set_tt_gate(bool) override { return true; }
     bool select_staged_bank() override { return true; }
     int active_bank() override { return 0; }
     bool reset_slot_state(uint32_t, uint64_t) override { return true; }
@@ -787,6 +808,83 @@ TEST(Phase0Completion, TimesOutWithoutAnRtCompletion)
     EXPECT_FALSE(done.applied);
     EXPECT_NE(done.error.find("no completion"), std::string::npos);
     EXPECT_EQ(port.now, kEpoch + 5 * kMs);
+    EXPECT_EQ(state.phase.load(), p0::Phase::kFailed);
+}
+
+class CountingRtPlatform final : public p0::RtPlatform
+{
+  public:
+    uint64_t now_ns() override { return now; }
+    void fire(const p0::RtSlot&, uint64_t, uint64_t) override { ++fires; }
+    void open_tt_gate() override { gate_open = true; }
+    uint64_t now = 0;
+    int fires = 0;
+    bool gate_open = false;
+};
+
+TEST(Phase0Completion, TimedOutReadyTableCannotApplyAfterRtResumes)
+{
+    p0::HandoverState state;
+    state.phase = p0::Phase::kReady;
+    ClockOnlyPort port;
+    p0::HandoverConfig config;
+    config.completion_timeout_ns = 5 * kMs;
+    const p0::Completion done =
+        p0::await_completion(state, port, kEpoch, config);
+    ASSERT_FALSE(done.applied);
+
+    timpani_ttsched_shm shm;
+    std::memset(&shm, 0, sizeof(shm));
+    CountingRtPlatform rt;
+    p0::RtEngine engine(state, rt, &shm);
+    engine.on_wake(kEpoch + 2 * kH);
+    EXPECT_TRUE(engine.failed());
+    EXPECT_EQ(rt.fires, 0);
+    EXPECT_FALSE(rt.gate_open);
+}
+
+class DeadlineCompletionPort final : public ClockOnlyPort
+{
+  public:
+    DeadlineCompletionPort(p0::HandoverState& state, uint64_t deadline)
+        : state_(state), deadline_(deadline)
+    {
+    }
+
+    void sleep_until(uint64_t t) override
+    {
+        now = std::max(now, t);
+        if (now >= deadline_ &&
+            state_.phase.load() == p0::Phase::kReady) {
+            state_.phase.store(p0::Phase::kApplying,
+                               std::memory_order_release);
+            state_.done_token.store(17, std::memory_order_relaxed);
+            state_.done_planned_ns.store(kEpoch, std::memory_order_relaxed);
+            state_.done_actual_ns.store(now, std::memory_order_relaxed);
+            state_.phase.store(p0::Phase::kApplied,
+                               std::memory_order_release);
+        }
+    }
+
+  private:
+    p0::HandoverState& state_;
+    uint64_t deadline_;
+};
+
+TEST(Phase0Completion, ConcurrentApplyAtTheDeadlineIsNotOverwritten)
+{
+    p0::HandoverState state;
+    state.phase = p0::Phase::kReady;
+    p0::HandoverConfig config;
+    config.completion_timeout_ns = 5 * kMs;
+    DeadlineCompletionPort port(state, kEpoch + config.completion_timeout_ns);
+
+    const p0::Completion done =
+        p0::await_completion(state, port, kEpoch, config);
+    EXPECT_TRUE(done.applied);
+    EXPECT_EQ(done.token, 17u);
+    EXPECT_EQ(done.actual_ns, kEpoch + 5 * kMs);
+    EXPECT_EQ(state.phase.load(), p0::Phase::kApplied);
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +927,11 @@ class RealPlatform final : public p0::RtPlatform, public p0::CoordinatorPort
     bool stage_bank(const p0::NPrepared&) override { return true; }
     void discard_staged_bank() override {}
     bool tt_idle(uint32_t) override { return true; }
-    void set_tt_gate(bool closed) override { gate.store(closed); }
+    bool set_tt_gate(bool closed) override
+    {
+        gate.store(closed);
+        return true;
+    }
     bool select_staged_bank() override
     {
         bank ^= 1;

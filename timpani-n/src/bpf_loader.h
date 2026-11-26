@@ -103,7 +103,10 @@ public:
     // fields with __atomic builtins.
     ::KernelControl* kernel_control();
     // P0-T04: tt_runnable_count_map[cpu]. Non-RT (map lookup syscall).
-    bool tt_runnable_count(uint32_t cpu, uint32_t& count) const;
+    bool tt_runnable_count(uint32_t cpu, uint64_t& count) const;
+    bool reset_tt_hold_tracking();
+    bool tt_hold_tracking_healthy() const;
+    bool drain_tt_held();
     // P0-T04: make the staged (shadow) bank active in the kernel and in the
     // userspace mirror without touching tt_handover_gate. Non-RT; the
     // caller keeps the gate closed until the boundary.
@@ -119,8 +122,11 @@ private:
     // handover and once its kernel references have drained to zero.
     bool clear_bank(int bank);
     void cleanup_old_bank(int old_bank);
+    bool kick_tt_cpu(uint32_t cpu);
+    bool tt_held_count(uint32_t cpu, uint64_t& count) const;
 
     int active_map_idx_;
+    uint64_t isolated_cpu_mask_;
     struct timpani_bpf* skel_;
 };
 

@@ -5,11 +5,13 @@
 #include "phase0_prepare.h"
 #include <dirent.h>
 #include <cerrno>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -140,7 +142,9 @@ static uint64_t detect_isolated_cpu_mask()
 namespace timpani {
 namespace node {
 
-BpfLoader::BpfLoader() : active_map_idx_(0), skel_(nullptr) {
+BpfLoader::BpfLoader()
+    : active_map_idx_(0), isolated_cpu_mask_(0), skel_(nullptr)
+{
 }
 
 BpfLoader::~BpfLoader() {
@@ -164,6 +168,8 @@ bool BpfLoader::load_programs() {
                   << std::endl;
         return false;
     }
+
+    isolated_cpu_mask_ = iso_mask;
 
     // Open skeleton (parse BPF ELF, do NOT load yet)
     skel_ = timpani_bpf__open();
@@ -203,6 +209,7 @@ void BpfLoader::unload_programs() {
         timpani_bpf__destroy(skel_);
         skel_ = nullptr;
     }
+    isolated_cpu_mask_ = 0;
 }
 
 int BpfLoader::tt_table_fd() const {
@@ -427,11 +434,66 @@ void BpfLoader::cleanup_old_bank(int old_bank) {
     return &skel_->bss->kernel_control;
 }
 
-bool BpfLoader::tt_runnable_count(uint32_t cpu, uint32_t& count) const {
+bool BpfLoader::tt_runnable_count(uint32_t cpu, uint64_t& count) const {
     if (!skel_) return false;
     int fd = bpf_map__fd(skel_->maps.tt_runnable_count_map);
     if (fd < 0) return false;
     return bpf_map_lookup_elem(fd, &cpu, &count) == 0;
+}
+
+bool BpfLoader::tt_held_count(uint32_t cpu, uint64_t& count) const {
+    if (!skel_) return false;
+    int fd = bpf_map__fd(skel_->maps.tt_held_count_map);
+    if (fd < 0) return false;
+    return bpf_map_lookup_elem(fd, &cpu, &count) == 0;
+}
+
+bool BpfLoader::reset_tt_hold_tracking() {
+    if (!skel_ || !skel_->bss) return false;
+    __atomic_store_n(&skel_->bss->tt_hold_failure_count, 0u,
+                     __ATOMIC_RELEASE);
+    return true;
+}
+
+bool BpfLoader::tt_hold_tracking_healthy() const {
+    return skel_ && skel_->bss &&
+           __atomic_load_n(&skel_->bss->tt_hold_failure_count,
+                           __ATOMIC_ACQUIRE) == 0;
+}
+
+bool BpfLoader::kick_tt_cpu(uint32_t cpu) {
+    if (!skel_ || !skel_->data || cpu >= 64) return false;
+    __atomic_store_n(&skel_->data->tt_kick_cpu_request, cpu,
+                     __ATOMIC_RELEASE);
+    LIBBPF_OPTS(bpf_test_run_opts, options);
+    const int program_fd = bpf_program__fd(skel_->progs.kick_tt_cpu);
+    return program_fd >= 0 &&
+           bpf_prog_test_run_opts(program_fd, &options) == 0 &&
+           options.retval == 0;
+}
+
+bool BpfLoader::drain_tt_held() {
+    constexpr auto timeout = std::chrono::milliseconds(100);
+    constexpr auto poll = std::chrono::milliseconds(1);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    for (;;) {
+        if (!tt_hold_tracking_healthy()) return false;
+
+        bool pending = false;
+        for (uint32_t cpu = 0; cpu < 64; ++cpu) {
+            if ((isolated_cpu_mask_ & (1ULL << cpu)) == 0) continue;
+            uint64_t held = 0;
+            if (!tt_held_count(cpu, held)) return false;
+            if (held != 0) {
+                pending = true;
+                if (!kick_tt_cpu(cpu)) return false;
+            }
+        }
+        if (!pending) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(poll);
+    }
 }
 
 bool BpfLoader::select_staged_bank() {

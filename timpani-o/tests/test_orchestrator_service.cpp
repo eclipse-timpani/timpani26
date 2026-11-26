@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -9,6 +12,18 @@
 
 #include "../src/fault_client.h"
 #include "../src/orchestrator_service.h"
+
+class OrchestratorServiceTestPeer
+{
+  public:
+    static void SetAppliedCallback(
+        timpani::orchestrator::OrchestratorServiceImpl& service,
+        std::function<void(const std::string&,
+                           const timpani::node::v1::TableApplied&)> callback)
+    {
+        service.phase0_ack_ = std::move(callback);
+    }
+};
 
 namespace {
 
@@ -19,9 +34,17 @@ class RecordingFaultService final : public schedinfo::v1::FaultService::Service
                              const schedinfo::v1::FaultInfo* request,
                              schedinfo::v1::Response* response) override
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        received_faults_.push_back(*request);
-        response->set_status(0);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            received_faults_.push_back(*request);
+            response->set_status(0);
+        }
+        {
+            std::unique_lock<std::mutex> lock(block_mutex_);
+            entered_ = true;
+            block_cv_.notify_all();
+            block_cv_.wait(lock, [this] { return !blocking_; });
+        }
         return grpc::Status::OK;
     }
 
@@ -33,13 +56,48 @@ class RecordingFaultService final : public schedinfo::v1::FaultService::Service
 
     void Clear()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        received_faults_.clear();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            received_faults_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(block_mutex_);
+            blocking_ = false;
+            entered_ = false;
+        }
+        block_cv_.notify_all();
+    }
+
+    void Block()
+    {
+        std::lock_guard<std::mutex> lock(block_mutex_);
+        blocking_ = true;
+        entered_ = false;
+    }
+
+    void Release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(block_mutex_);
+            blocking_ = false;
+        }
+        block_cv_.notify_all();
+    }
+
+    bool WaitUntilEntered() const
+    {
+        std::unique_lock<std::mutex> lock(block_mutex_);
+        return block_cv_.wait_for(lock, std::chrono::seconds(1),
+                                  [this] { return entered_; });
     }
 
   private:
     mutable std::mutex mutex_;
+    mutable std::mutex block_mutex_;
+    mutable std::condition_variable block_cv_;
     std::vector<schedinfo::v1::FaultInfo> received_faults_;
+    bool blocking_ = false;
+    bool entered_ = false;
 };
 
 RecordingFaultService fault_service;
@@ -218,6 +276,46 @@ TEST_F(OrchestratorServiceTest, BroadcastRecoverySignalWritesAction)
     EXPECT_EQ(command.recovery().workload_id(), "workload-1");
     EXPECT_EQ(command.recovery().action(),
               timpani::node::v1::RecoverySignal::ACTION_RESTART);
+}
+
+TEST_F(OrchestratorServiceTest, FaultForwardingDoesNotBlockTableApplied)
+{
+    ConnectNode();
+    std::atomic<bool> applied{false};
+    OrchestratorServiceTestPeer::SetAppliedCallback(
+        *service_, [&](const std::string& node,
+                       const timpani::node::v1::TableApplied& table) {
+            if (node == "node-1" && table.table_id() == "blocked-fault") {
+                applied.store(true, std::memory_order_release);
+            }
+        });
+    fault_service.Block();
+
+    timpani::node::v1::NodeEvent fault_event;
+    fault_event.set_node_id("node-1");
+    auto* fault = fault_event.mutable_fault();
+    fault->set_workload_id("workload-1");
+    fault->set_task_id("task-1");
+    fault->set_fault_type(timpani::node::v1::FaultType::DMISS);
+    ASSERT_TRUE(stream_->Write(fault_event));
+    const bool fault_entered = fault_service.WaitUntilEntered();
+
+    timpani::node::v1::NodeEvent applied_event;
+    applied_event.set_node_id("node-1");
+    applied_event.mutable_applied()->set_table_id("blocked-fault");
+    applied_event.mutable_applied()->set_success(true);
+    ASSERT_TRUE(stream_->Write(applied_event));
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(500);
+    while (!applied.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool applied_while_blocked = applied.load(std::memory_order_acquire);
+    fault_service.Release();
+
+    ASSERT_TRUE(fault_entered);
+    ASSERT_TRUE(applied_while_blocked);
 }
 
 TEST_F(OrchestratorServiceTest, NodeStreamDispatchesEventsAndForwardsFaults)

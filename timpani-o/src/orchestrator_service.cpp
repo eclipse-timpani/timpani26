@@ -9,9 +9,50 @@
 namespace timpani {
 namespace orchestrator {
 
-OrchestratorServiceImpl::OrchestratorServiceImpl() {}
+OrchestratorServiceImpl::OrchestratorServiceImpl()
+    : fault_worker_(&OrchestratorServiceImpl::forward_faults, this)
+{
+}
 
-OrchestratorServiceImpl::~OrchestratorServiceImpl() {}
+OrchestratorServiceImpl::~OrchestratorServiceImpl()
+{
+    {
+        std::lock_guard<std::mutex> lock(fault_queue_mutex_);
+        fault_worker_running_.store(false, std::memory_order_release);
+        fault_queue_.clear();
+    }
+    fault_queue_cv_.notify_all();
+    if (fault_worker_.joinable()) fault_worker_.join();
+}
+
+void OrchestratorServiceImpl::forward_faults()
+{
+    for (;;) {
+        PendingFault fault;
+        {
+            std::unique_lock<std::mutex> lock(fault_queue_mutex_);
+            fault_queue_cv_.wait(lock, [this] {
+                return !fault_worker_running_.load(std::memory_order_acquire) ||
+                       !fault_queue_.empty();
+            });
+            if (fault_queue_.empty() &&
+                !fault_worker_running_.load(std::memory_order_acquire)) {
+                return;
+            }
+            fault = std::move(fault_queue_.front());
+            fault_queue_.pop_front();
+        }
+
+        if (!FaultServiceClient::GetInstance().NotifyFault(
+                fault.workload_id, fault.node_id, fault.task_id,
+                static_cast<schedinfo::v1::FaultType>(fault.fault_type),
+                fault.dmiss_count)) {
+            TLOG_WARN("[Orchestrator] Fault forwarding failed (queued for "
+                      "retry if enabled): workload=", fault.workload_id,
+                      " task=", fault.task_id);
+        }
+    }
+}
 
 grpc::Status OrchestratorServiceImpl::NodeStream(
     grpc::ServerContext* context,
@@ -119,19 +160,19 @@ void OrchestratorServiceImpl::handle_fault_info(const FaultInfo& fault, Connecte
                   << " current_limit=" << fault.current_limit() << std::endl;
     }
 
-    bool forwarded = FaultServiceClient::GetInstance().NotifyFault(
-        workload_id,
-        node.node_id,
-        task_id,
-        proto_fault_type,
-        fault.dmiss_count()
-    );
-
-    if (!forwarded) {
-        std::cerr << "[Orchestrator] Fault forwarding failed (queued for retry if enabled): "
-                  << "workload=" << workload_id << " task=" << task_id
-                  << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(fault_queue_mutex_);
+        if (fault_queue_.size() >= kMaxFaultQueue) {
+            fault_queue_.pop_front();
+            TLOG_WARN("[Orchestrator] Fault queue full; dropping oldest event");
+        }
+        fault_queue_.push_back(PendingFault{std::move(workload_id),
+                                             node.node_id,
+                                             std::move(task_id),
+                                             static_cast<int>(proto_fault_type),
+                                             fault.dmiss_count()});
     }
+    fault_queue_cv_.notify_one();
 }
 
 void OrchestratorServiceImpl::handle_table_applied(const TableApplied& applied, ConnectedNode& node) {

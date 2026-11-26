@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <chrono>
 #include <iostream>
 
 #include "tlog.h"
@@ -78,6 +79,8 @@ bool FaultServiceClient::SendFaultRpc(const FaultInfo& request)
 {
     Response reply;
     ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                         std::chrono::seconds(1));
 
     TLOG_INFO("Notifying Pullpiri - Workload: ", request.workload_id(),
               ", Node: ", request.node_id(), ", Task: ", request.task_name(),

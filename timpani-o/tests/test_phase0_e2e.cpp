@@ -5,8 +5,8 @@
 
 // DDR-011 Phase 0 P0-T06: target end-to-end driver. It plays Timpani-O for
 // one real Timpani-N and runs the TC-P0-01..04 and TC-P0-06 sequence through
-// the O -> N full_table path. Skipped unless TIMPANI_P0_E2E=1; the target
-// procedure is in doc/design/DDR-011-runtime-table-update-phase0/.
+// the O -> N full_table path. Skipped unless TIMPANI_P0_E2E=1; see section
+// 5.4 in doc/design/DDR-011-runtime-table-update-phase0/implementation_plan.md.
 
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
@@ -287,8 +287,8 @@ class Phase0E2ETest : public ::testing::Test
             "\" table_id=" + table_id +
             " result=" + (confirmed_id == table_id ? "applied" : "rejected") +
             " confirmed=" + Join(confirmed));
-        EXPECT_EQ(confirmed_id == table_id, applied) << name;
-        EXPECT_EQ(confirmed, expected) << name;
+        ASSERT_EQ(confirmed_id == table_id, applied) << name;
+        ASSERT_EQ(confirmed, expected) << name;
     }
 
     std::shared_ptr<NodeConfigManager> config_;

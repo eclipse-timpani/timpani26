@@ -237,9 +237,9 @@ Connect N and pre-register trial processes before submitting the baseline.
   Generation failure and a matching negative ACK leave them unchanged.
 - Only one attempt is retained, including while awaiting its first connection.
   Further requests are rejected immediately; no queue, merge, retry or replay.
-- ADD/REMOVE preserve retained slots. Generated H mismatches are rejected,
-  never fixed by overwriting H. CLEAR preserves E/H and later ADD must regenerate
-  the same H with all repetitions.
+- ADD/REMOVE preserve retained slots. A candidate minimum LCM must divide the
+  confirmed H; generated slots are repeated over H instead of overwriting it.
+  A multiple or non-divisor H is rejected. CLEAR preserves E/H for later ADDs.
 - Limits: 32 unique tasks, 2048 slots, ASCII workload/task IDs of 1..15 bytes.
   CBS, MODIFY, multiple nodes/CPUs, changed E/H/CPU and reused task identities
   across workloads are outside Phase 0.

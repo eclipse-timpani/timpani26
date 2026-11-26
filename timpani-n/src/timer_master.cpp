@@ -129,8 +129,9 @@ class Phase0CoordinatorPort final : public phase0::CoordinatorPort
 
     bool tt_idle(uint32_t cpu) override
     {
-        uint32_t runnable = 0;
-        if (!bpf_.tt_runnable_count(cpu, runnable) || runnable != 0) {
+        uint64_t runnable = 0;
+        if (!bpf_.tt_hold_tracking_healthy() ||
+            !bpf_.tt_runnable_count(cpu, runnable) || runnable != 0) {
             return false;
         }
         const uint32_t bank =
@@ -139,10 +140,11 @@ class Phase0CoordinatorPort final : public phase0::CoordinatorPort
                                __ATOMIC_SEQ_CST) == 0;
     }
 
-    void set_tt_gate(bool closed) override
+    bool set_tt_gate(bool closed) override
     {
         __atomic_store_n(&control_->tt_handover_gate, closed ? 1u : 0u,
                          __ATOMIC_SEQ_CST);
+        return closed || bpf_.drain_tt_held();
     }
 
     bool select_staged_bank() override { return bpf_.select_staged_bank(); }
@@ -705,6 +707,9 @@ bool TimerMaster::apply_phase0_table(const phase0::NPrepared& prepared,
     if (!ttsched_shm_ || !control) {
         return reject("ttsched SHM or the BPF scheduler is unavailable");
     }
+    if (!bpf_loader_.reset_tt_hold_tracking()) {
+        return reject("resetting the TT hold tracking failed");
+    }
 
     auto next = std::make_unique<phase0::Context>();
     std::string error;
@@ -735,6 +740,11 @@ bool TimerMaster::apply_phase0_table(const phase0::NPrepared& prepared,
     if (!done.applied) {
         phase0_failed_ = true;
         result.error = done.error;
+        return false;
+    }
+    if (!bpf_loader_.drain_tt_held()) {
+        phase0_failed_ = true;
+        result.error = "held TT tasks did not drain after the gate reopened";
         return false;
     }
 

@@ -201,8 +201,13 @@ bool RtEngine::check_boundary(uint64_t boundary, uint64_t now)
         if (planned > boundary) return true;
         if (phase == Phase::kReady && planned == boundary &&
             state_.context.load(std::memory_order_relaxed) != nullptr) {
-            apply(boundary);
-            return true;
+            if (state_.phase.compare_exchange_strong(
+                    phase, Phase::kApplying, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                apply(boundary);
+                return true;
+            }
+            continue;
         }
 
         // Committed but not ready at its boundary, or the boundary was
@@ -380,13 +385,19 @@ ArmResult arm_handover(HandoverState& state, CoordinatorPort& port,
         // Re-checked after the store so that the RT thread, which reaches the
         // boundary later, is guaranteed to see the commit.
         bool roll_back = port.now_ns() + config.margin_ns > boundary;
+        bool gate_reopened = true;
         if (!roll_back) {
-            port.set_tt_gate(true);
+            roll_back = !port.set_tt_gate(true);
             // A TT activation that raced with the gate is still visible here.
-            roll_back = !tt_idle();
-            if (roll_back) port.set_tt_gate(false);
+            roll_back = roll_back || !tt_idle();
+            if (roll_back) gate_reopened = port.set_tt_gate(false);
         }
         if (roll_back) {
+            if (!gate_reopened) {
+                state.phase.store(Phase::kFailed, std::memory_order_release);
+                return failed("held TT tasks did not drain on rollback",
+                              boundary);
+            }
             Phase expected = Phase::kCommitting;
             if (!state.phase.compare_exchange_strong(
                     expected, Phase::kIdle, std::memory_order_acq_rel)) {
@@ -455,8 +466,21 @@ Completion await_completion(HandoverState& state, CoordinatorPort& port,
         }
         const uint64_t now = port.now_ns();
         if (now >= deadline) {
-            done.error = "no completion from the RT thread";
-            return done;
+            Phase expected = Phase::kReady;
+            if (state.phase.compare_exchange_strong(
+                    expected, Phase::kFailed,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                done.error = "no completion from the RT thread";
+                return done;
+            }
+            if (expected == Phase::kApplied || expected == Phase::kFailed)
+                continue;
+            if (expected != Phase::kApplying) {
+                done.error = "handover changed state while awaiting completion";
+                return done;
+            }
+            continue;
         }
         port.sleep_until(std::min(now + config.poll_ns, deadline));
     }

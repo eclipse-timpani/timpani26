@@ -5,12 +5,17 @@
 
 #include <grpcpp/grpcpp.h>
 #include "proto/node_control.grpc.pb.h"
-#include <map>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
+class OrchestratorServiceTestPeer;
 class SchedInfoServer;
 
 namespace timpani {
@@ -33,7 +38,17 @@ public:
     std::vector<std::string> get_connected_node_ids();
 
 private:
+    friend class ::OrchestratorServiceTestPeer;
     friend class ::SchedInfoServer;
+
+    static constexpr size_t kMaxFaultQueue = 1024;
+    struct PendingFault {
+        std::string workload_id;
+        std::string node_id;
+        std::string task_id;
+        int fault_type = 0;
+        uint32_t dmiss_count = 0;
+    };
 
     std::string phase0_node_id_;
     std::function<void(const std::string&, const TableApplied&)> phase0_ack_;
@@ -47,6 +62,13 @@ private:
     std::mutex nodes_mutex_;
     std::map<std::string, std::shared_ptr<ConnectedNode>> connected_nodes_;
 
+    std::mutex fault_queue_mutex_;
+    std::condition_variable fault_queue_cv_;
+    std::deque<PendingFault> fault_queue_;
+    std::atomic<bool> fault_worker_running_{true};
+    std::thread fault_worker_;
+
+    void forward_faults();
     void handle_node_ready(const NodeReady& ready, ConnectedNode& node);
     void handle_node_status(const NodeStatus& status, ConnectedNode& node);
     void handle_fault_info(const FaultInfo& fault, ConnectedNode& node);
