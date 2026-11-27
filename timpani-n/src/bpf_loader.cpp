@@ -385,7 +385,7 @@ bool BpfLoader::stage_table(const phase0::NPrepared& prepared) {
         TaskMeta meta = {};
         meta.workload_id_hash = task.workload_id_hash;
         meta.task_id_hash = task_hash;
-        meta.assigned_cpu = prepared.has_cpu ? prepared.cpu : 0;
+        meta.assigned_cpu = task.assigned_cpu;
         meta.scheduling_type = SCHED_TYPE_TT;
         meta.tt_runnable = 0;
         meta.activation_ns = 0;
@@ -448,6 +448,13 @@ bool BpfLoader::tt_held_count(uint32_t cpu, uint64_t& count) const {
     return bpf_map_lookup_elem(fd, &cpu, &count) == 0;
 }
 
+bool BpfLoader::tt_retired_count(uint32_t cpu, uint64_t& count) const {
+    if (!skel_) return false;
+    int fd = bpf_map__fd(skel_->maps.tt_retired_count_map);
+    if (fd < 0) return false;
+    return bpf_map_lookup_elem(fd, &cpu, &count) == 0;
+}
+
 bool BpfLoader::reset_tt_hold_tracking() {
     if (!skel_ || !skel_->bss) return false;
     __atomic_store_n(&skel_->bss->tt_hold_failure_count, 0u,
@@ -484,8 +491,11 @@ bool BpfLoader::drain_tt_held() {
         for (uint32_t cpu = 0; cpu < 64; ++cpu) {
             if ((isolated_cpu_mask_ & (1ULL << cpu)) == 0) continue;
             uint64_t held = 0;
-            if (!tt_held_count(cpu, held)) return false;
-            if (held != 0) {
+            uint64_t retired = 0;
+            if (!tt_held_count(cpu, held) ||
+                !tt_retired_count(cpu, retired))
+                return false;
+            if (held != 0 || retired != 0) {
                 pending = true;
                 if (!kick_tt_cpu(cpu)) return false;
             }

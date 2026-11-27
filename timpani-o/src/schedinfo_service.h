@@ -14,6 +14,7 @@
 #include <set>
 #include <shared_mutex>
 #include <thread>
+#include <vector>
 #include <grpcpp/grpcpp.h>
 
 #include "proto/schedinfo.grpc.pb.h"
@@ -86,7 +87,7 @@ class SchedInfoServiceImpl final : public SchedInfoService::Service
     struct Phase0State {
         std::mutex mutex;
         std::string node_id;
-        int cpu = -1;
+        std::vector<int> cpus;
         std::optional<OConfirmed> confirmed;
         std::optional<OAttempt> attempt;
         std::map<std::string, std::string> task_workloads;

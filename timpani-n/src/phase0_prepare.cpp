@@ -304,7 +304,17 @@ bool prepare_table(const Table& table, const ActiveBaseline& active,
     std::set<uint32_t> cpus;
     size_t slot_count = 0;
     for (const auto& partition : table.partitions()) {
-        for (uint32_t cpu : partition.cpuset().cpus()) cpus.insert(cpu);
+        bool has_slots = false;
+        for (const auto& layer : partition.layers())
+            has_slots = has_slots || layer.tt_slots_size() != 0;
+        if (partition.cpuset().cpus_size() == 0 && !has_slots) continue;
+        if (!partition.cpuset().isolated() ||
+            partition.cpuset().cpus_size() != 1) {
+            return fail(error,
+                        "partition must contain one isolated CPU");
+        }
+        const uint32_t partition_cpu = partition.cpuset().cpus(0);
+        cpus.insert(partition_cpu);
         for (const auto& layer : partition.layers()) {
             if (layer.model() != timpani::node::v1::TIME_TRIGGERED) {
                 return fail(error, "non-TT layer is outside Phase 0");
@@ -330,8 +340,11 @@ bool prepare_table(const Table& table, const ActiveBaseline& active,
     std::map<std::string, uint64_t> task_by_id;
     std::map<uint64_t, std::string> task_by_hash;
     std::map<uint64_t, uint64_t> task_workload;
+    std::map<uint64_t, uint32_t> task_cpu;
     uint32_t slot_idx = 0;
     for (const auto& partition : table.partitions()) {
+        if (partition.cpuset().cpus_size() == 0) continue;
+        const uint32_t partition_cpu = partition.cpuset().cpus(0);
         for (const auto& layer : partition.layers()) {
             for (const auto& slot : layer.tt_slots()) {
                 const std::string where =
@@ -346,6 +359,9 @@ bool prepare_table(const Table& table, const ActiveBaseline& active,
                 if (!slot_fits_hyperperiod(slot.offset_us(), slot.duration_us(),
                                            table.hyperperiod_us())) {
                     return fail(error, where + "slot end exceeds hyperperiod");
+                }
+                if (slot.cpu() != partition_cpu) {
+                    return fail(error, where + "slot CPU differs from partition");
                 }
                 if (!is_isolated(env.isolated_cpu_mask, slot.cpu())) {
                     return fail(error, where + "CPU " +
@@ -369,6 +385,11 @@ bool prepare_table(const Table& table, const ActiveBaseline& active,
                     return fail(error, "task belongs to multiple workloads: " +
                                            slot.task_id());
                 }
+                auto assigned = task_cpu.emplace(slot.task_id_hash(), slot.cpu());
+                if (!assigned.second && assigned.first->second != slot.cpu()) {
+                    return fail(error, "task moves between CPUs: " +
+                                           slot.task_id());
+                }
                 cpus.insert(slot.cpu());
 
                 PreparedSlot entry;
@@ -390,20 +411,18 @@ bool prepare_table(const Table& table, const ActiveBaseline& active,
         }
     }
 
-    if (cpus.size() > 1)
-        return fail(error, "multiple CPUs are outside Phase 0");
     if (!cpus.empty()) {
-        const uint32_t cpu = *cpus.begin();
-        if (!is_isolated(env.isolated_cpu_mask, cpu)) {
-            return fail(error,
-                        "CPU " + std::to_string(cpu) + " is not isolated");
+        for (uint32_t cpu : cpus) {
+            if (!is_isolated(env.isolated_cpu_mask, cpu)) {
+                return fail(error,
+                            "CPU " + std::to_string(cpu) + " is not isolated");
+            }
         }
-        if (active.has_cpu && active.cpu != cpu) {
-            return fail(error, "CPU differs from the active table");
-        }
+        prepared.cpus = cpus;
         prepared.has_cpu = true;
-        prepared.cpu = cpu;
+        prepared.cpu = *cpus.begin();
     } else {
+        prepared.cpus = active.cpus;
         prepared.has_cpu = active.has_cpu;
         prepared.cpu = active.cpu;
     }
@@ -476,15 +495,21 @@ bool prepare_table(const Table& table, const ActiveBaseline& active,
         if (pid <= 0 || !used_pids.insert(pid).second) {
             return fail(error, "task PID is invalid or shared: " + id);
         }
+        const uint32_t assigned_cpu = task_cpu.at(hash);
         auto retained = active.tasks.find(hash);
         if (retained != active.tasks.end() && retained->second.pid != pid) {
             return fail(error, "retained task PID changed: " + id);
+        }
+        if (retained != active.tasks.end() &&
+            retained->second.assigned_cpu != assigned_cpu) {
+            return fail(error, "retained task CPU changed: " + id);
         }
         TaskRecord record;
         record.task_id = id;
         record.workload_id_hash = task_workload.at(hash);
         record.workload_id = workload_by_hash.at(record.workload_id_hash);
         record.pid = pid;
+        record.assigned_cpu = assigned_cpu;
         prepared.tasks.emplace(hash, std::move(record));
     }
 
@@ -560,6 +585,7 @@ ActiveBaseline baseline_from(const NPrepared& prepared)
     active.hyperperiod_us = prepared.hyperperiod_us;
     active.has_cpu = prepared.has_cpu;
     active.cpu = prepared.cpu;
+    active.cpus = prepared.cpus;
     active.slots = prepared.slots;
     active.tasks = prepared.tasks;
     active.workloads = prepared.workloads;

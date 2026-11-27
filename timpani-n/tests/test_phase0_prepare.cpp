@@ -92,7 +92,7 @@ bool same_records(const std::map<uint64_t, p0::TaskRecord>& a,
         if (ia->first != ib->first || x.task_id != y.task_id ||
             x.workload_id != y.workload_id ||
             x.workload_id_hash != y.workload_id_hash || x.pid != y.pid ||
-            x.shm_index != y.shm_index) {
+            x.assigned_cpu != y.assigned_cpu || x.shm_index != y.shm_index) {
             return false;
         }
     }
@@ -122,7 +122,7 @@ bool same_baseline(const p0::ActiveBaseline& a, const p0::ActiveBaseline& b)
 {
     return a.has_table == b.has_table && a.epoch_ns == b.epoch_ns &&
            a.hyperperiod_us == b.hyperperiod_us && a.has_cpu == b.has_cpu &&
-           a.cpu == b.cpu && same_records(a.tasks, b.tasks) &&
+           a.cpu == b.cpu && a.cpus == b.cpus && same_records(a.tasks, b.tasks) &&
            a.workloads == b.workloads && same_slots(a.slots, b.slots);
 }
 
@@ -273,6 +273,34 @@ TEST_F(Phase0PrepareTest, SuccessReplacesStaleCandidate)
     EXPECT_TRUE(out.removed_tasks.empty());
 }
 
+TEST_F(Phase0PrepareTest, AcceptsOneIsolatedCpuPerPartition)
+{
+    Table table = make_table("t-multi-cpu");
+    add_slot(table, "wlA", "taskA", 0);
+    auto* partition = table.add_partitions();
+    partition->set_partition_id("p1");
+    partition->mutable_cpuset()->add_cpus(3);
+    partition->mutable_cpuset()->set_isolated(true);
+    auto* layer = partition->add_layers();
+    layer->set_layer_index(2);
+    layer->set_model(timpani::node::v1::TIME_TRIGGERED);
+    auto* slot = layer->add_tt_slots();
+    slot->set_workload_id("wlB");
+    slot->set_task_id("taskB");
+    slot->set_offset_us(5000);
+    slot->set_duration_us(100);
+    slot->set_deadline_us(100);
+    slot->set_cpu(3);
+    slot->set_workload_id_hash(fnv1a("wlB"));
+    slot->set_task_id_hash(fnv1a("taskB"));
+    slot->set_current_limit(3);
+
+    const p0::NPrepared prepared = accept(table);
+    EXPECT_EQ(prepared.cpus, (std::set<uint32_t>{2, 3}));
+    EXPECT_EQ(prepared.tasks.at(fnv1a("taskA")).assigned_cpu, 2u);
+    EXPECT_EQ(prepared.tasks.at(fnv1a("taskB")).assigned_cpu, 3u);
+}
+
 TEST_F(Phase0PrepareTest, BaselineFromCopiesAcceptedState)
 {
     Table table = make_table();
@@ -364,17 +392,16 @@ TEST_F(Phase0PrepareTest, RejectsCbsEntries)
     expect_reject(table, "CBS entries");
 }
 
-TEST_F(Phase0PrepareTest, RejectsMultipleCpus)
+TEST_F(Phase0PrepareTest, RejectsMultiCpuPartitionsAndSlotCpuMismatch)
 {
     Table slots = make_table();
-    add_slot(slots, "wlA", "taskA", 0, 100, 2);
-    add_slot(slots, "wlA", "taskB", 0, 100, 3);
-    expect_reject(slots, "multiple CPUs");
+    add_slot(slots, "wlA", "taskA", 0, 100, 3);
+    expect_reject(slots, "slot CPU differs from partition");
 
     Table cpuset = make_table();
     cpuset.mutable_partitions(0)->mutable_cpuset()->add_cpus(3);
     add_slot(cpuset, "wlA", "taskA", 0);
-    expect_reject(cpuset, "multiple CPUs");
+    expect_reject(cpuset, "one isolated CPU");
 }
 
 TEST_F(Phase0PrepareTest, RejectsNonIsolatedCpu)
@@ -407,7 +434,7 @@ TEST_F(Phase0PrepareTest, RejectsCpuChangeFromActive)
     Table moved = make_table("t2");
     moved.mutable_partitions(0)->mutable_cpuset()->set_cpus(0, 3);
     add_slot(moved, "wlA", "taskA", 0, 100, 3);
-    expect_reject(moved, "CPU differs");
+    expect_reject(moved, "retained workload slot parameters changed");
 }
 
 TEST_F(Phase0PrepareTest, RejectsBoundaryOutsideUint64Range)

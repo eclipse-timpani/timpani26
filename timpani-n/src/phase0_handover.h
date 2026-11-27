@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,7 @@ struct Context {
     uint64_t hyperperiod_ns = 0;
     bool has_cpu = false;
     uint32_t cpu = 0;
+    std::set<uint32_t> cpus;
     uint64_t tt_free_offset_ns = 0;  // G - S: end of the last slot in H
     std::vector<RtSlot> slots;       // ordered like NPrepared::slots
 };

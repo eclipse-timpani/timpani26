@@ -51,6 +51,8 @@ bool build_context(const NPrepared& prepared, uint64_t token, Context& out,
         static_cast<uint64_t>(prepared.hyperperiod_us) * 1000ULL;
     ctx.has_cpu = prepared.has_cpu;
     ctx.cpu = prepared.cpu;
+    ctx.cpus = prepared.cpus;
+    if (ctx.cpus.empty() && ctx.has_cpu) ctx.cpus.insert(ctx.cpu);
     if (ctx.hyperperiod_ns == 0) {
         error = "hyperperiod must be positive";
         return false;
@@ -80,6 +82,7 @@ bool build_context(const NPrepared& prepared, uint64_t token, Context& out,
             error = "TT slots are not ordered by offset";
             return false;
         }
+        ctx.cpus.insert(rt.cpu);
         ctx.tt_free_offset_ns = std::max(ctx.tt_free_offset_ns, rt.end_ns);
         ctx.slots.push_back(rt);
     }
@@ -331,9 +334,14 @@ ArmResult arm_handover(HandoverState& state, CoordinatorPort& port,
         return rejected(std::move(error));
     };
 
-    const bool has_cpu = next.has_cpu || (active && active->has_cpu);
-    const uint32_t cpu = next.has_cpu ? next.cpu : (active ? active->cpu : 0);
-    auto tt_idle = [&]() { return !has_cpu || port.tt_idle(cpu); };
+    std::set<uint32_t> cpus = next.cpus;
+    if (active) cpus.insert(active->cpus.begin(), active->cpus.end());
+    if (cpus.empty() && (next.has_cpu || (active && active->has_cpu)))
+        cpus.insert(next.has_cpu ? next.cpu : active->cpu);
+    auto tt_idle = [&]() {
+        return std::all_of(cpus.begin(), cpus.end(),
+                           [&port](uint32_t cpu) { return port.tt_idle(cpu); });
+    };
 
     for (unsigned attempt = 0; attempt < config.max_boundaries; ++attempt) {
         uint64_t now = port.now_ns();
@@ -415,12 +423,20 @@ ArmResult arm_handover(HandoverState& state, CoordinatorPort& port,
         std::string error;
         if (!port.select_staged_bank()) {
             error = "selecting the staged BPF bank failed";
-        } else if (has_cpu &&
-                   !port.reset_slot_state(
-                       cpu, next.slots.empty()
-                                ? 0
-                                : boundary + next.slots.front().offset_ns)) {
-            error = "resetting the BPF slot state failed";
+        } else {
+            for (uint32_t cpu : cpus) {
+                auto first = std::find_if(
+                    next.slots.begin(), next.slots.end(),
+                    [cpu](const RtSlot& slot) { return slot.cpu == cpu; });
+                const uint64_t next_ns =
+                    first == next.slots.end()
+                        ? 0
+                        : boundary + first->offset_ns;
+                if (!port.reset_slot_state(cpu, next_ns)) {
+                    error = "resetting the BPF slot state failed";
+                    break;
+                }
+            }
         }
         Phase expected = Phase::kCommitting;
         if (!error.empty()) {

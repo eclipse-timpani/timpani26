@@ -24,6 +24,9 @@ public:
     static bool Replace(SchedInfoServiceImpl& service, const std::vector<SchedInfo>& inputs) {
         return service.SubmitPhase0Update(SchedInfoServiceImpl::Phase0Operation::Replace, inputs);
     }
+    static bool Add(SchedInfoServiceImpl& service, const std::vector<SchedInfo>& inputs) {
+        return service.SubmitPhase0Update(SchedInfoServiceImpl::Phase0Operation::Add, inputs);
+    }
     static bool Clear(SchedInfoServiceImpl& service) {
         return service.SubmitPhase0Update(SchedInfoServiceImpl::Phase0Operation::Clear, {});
     }
@@ -38,6 +41,17 @@ public:
     static bool Stopped(SchedInfoServiceImpl& service) {
         std::lock_guard<std::mutex> lock(service.phase0_->mutex);
         return service.phase0_->stopped;
+    }
+    static void ConfirmCurrentAttempt(SchedInfoServiceImpl& service) {
+        std::lock_guard<std::mutex> lock(service.phase0_->mutex);
+        ASSERT_TRUE(service.phase0_->attempt);
+        service.phase0_->confirmed = service.phase0_->attempt->candidate;
+        if (service.phase0_->attempt->completion) {
+            service.phase0_->attempt->completion->completed = true;
+            service.phase0_->attempt->completion->success = true;
+        }
+        service.phase0_->attempt.reset();
+        service.phase0_->settled.notify_all();
     }
     static void SettleAndInstallUnrelatedAttempt(SchedInfoServiceImpl& service) {
         std::lock_guard<std::mutex> lock(service.phase0_->mutex);
@@ -700,6 +714,40 @@ TEST(Phase0ConfigurationTest, MissingMultiNodeAndLateActivationAreRejected)
     ASSERT_TRUE(active.Start(0));
     EXPECT_FALSE(active.EnablePhase0(orchestrator));
     active.Stop();
+}
+
+TEST(Phase0ConfigurationTest, TwoConfiguredCpusAcceptDistributedPhase0Table)
+{
+    auto config = std::make_shared<NodeConfigManager>();
+    ASSERT_TRUE(config->LoadFromFile(PHASE0_TWO_CPU_NODE_CONFIG));
+    timpani::orchestrator::OrchestratorServiceImpl orchestrator;
+    SchedInfoServer server(config);
+    ASSERT_TRUE(server.EnablePhase0(orchestrator));
+
+    auto& service = Phase0TestPeer::Service(server);
+    ASSERT_TRUE(Phase0TestPeer::Replace(service, {w1(), w2()}));
+    const auto table = Phase0TestPeer::Candidate(service);
+    ASSERT_TRUE(Phase0TestPeer::Validate(service, table));
+
+    std::set<uint32_t> observed_cpus;
+    for (const auto& partition : table.partitions()) {
+        ASSERT_EQ(partition.cpuset().cpus_size(), 1);
+        observed_cpus.insert(partition.cpuset().cpus(0));
+        for (const auto& layer : partition.layers()) {
+            for (const auto& slot : layer.tt_slots())
+                EXPECT_EQ(slot.cpu(), partition.cpuset().cpus(0));
+        }
+    }
+    EXPECT_EQ(observed_cpus, (std::set<uint32_t>{2, 3}));
+
+    const auto initial_w1 = slots(table, "W1");
+    const auto initial_w2 = slots(table, "W2");
+    Phase0TestPeer::ConfirmCurrentAttempt(service);
+    ASSERT_TRUE(Phase0TestPeer::Add(service, {w3()}));
+    const auto updated = Phase0TestPeer::Candidate(service);
+    EXPECT_EQ(slots(updated, "W1"), initial_w1);
+    EXPECT_EQ(slots(updated, "W2"), initial_w2);
+    EXPECT_TRUE(Phase0TestPeer::Validate(service, updated));
 }
 
 TEST(Phase0ConfigurationTest, OneUnsentAttemptWaitsForInitialConnectionWithoutQueueing)

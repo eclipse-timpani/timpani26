@@ -18,10 +18,10 @@
 #define DSQ_THROTTLED 102
 #define DSQ_BE 103
 #define DSQ_TT_HELD_BASE 104
-#define DSQ_TT_QUARANTINE (DSQ_TT_HELD_BASE + 64)
 #define PROMOTE_BUDGET 16
 #define TT_ACTIVE_RUNNING 0xffffffffffffffffULL
-#define TT_HELD_RETIRED 0xffffffffU
+#define TT_HELD_RETIRED_BASE 0x80000000U
+#define TT_HELD_CPU_MASK 0x3fU
 
 /* Isolated CPU bitmask injected by BpfLoader before attach.
  * Used by select_cpu() and enqueue() to validate assigned_cpu. */
@@ -120,10 +120,17 @@ struct {
 } tt_held_count_map SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 128);  // Max CPUs
+    __type(key, __u32);
+    __type(value, __u64);
+} tt_retired_count_map SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
     __type(key, __u32);
-    __type(value, __u32);  // assigned CPU, or TT_HELD_RETIRED
+    __type(value, __u32);  // assigned CPU, or encoded retired CPU
 } tt_held_cpu_map SEC(".maps");
 
 struct {
@@ -228,6 +235,16 @@ static __always_inline bool tt_active_on_cpu(__u32 cpu, __u64 now)
     return active_until && *active_until > now;
 }
 
+static __always_inline bool tt_held_is_retired(__u32 value)
+{
+    return (value & TT_HELD_RETIRED_BASE) != 0;
+}
+
+static __always_inline __u32 tt_held_retired_cpu(__u32 value)
+{
+    return value & TT_HELD_CPU_MASK;
+}
+
 static __always_inline void mark_tt_runnable(struct TaskMeta* meta, __u32 cpu)
 {
     __u64* runnable_count;
@@ -270,7 +287,7 @@ static __always_inline bool mark_tt_held(__u32 pid, struct TaskMeta* meta,
     __u64 active_until = TT_ACTIVE_RUNNING;
 
     if (held_cpu)
-        return *held_cpu != TT_HELD_RETIRED;
+        return !tt_held_is_retired(*held_cpu);
     held_count = bpf_map_lookup_elem(&tt_held_count_map, &cpu);
     runnable_count = bpf_map_lookup_elem(&tt_runnable_count_map, &cpu);
     if (!held_count || !runnable_count ||
@@ -293,7 +310,7 @@ static __always_inline bool release_tt_held(__u32 pid,
     __u32* held_cpu = bpf_map_lookup_elem(&tt_held_cpu_map, &pid);
     __u64 active_until = TT_ACTIVE_RUNNING;
 
-    if (!held_cpu || *held_cpu == TT_HELD_RETIRED)
+    if (!held_cpu || tt_held_is_retired(*held_cpu))
         return false;
     meta->tt_runnable = 1;
     bpf_map_update_elem(&tt_active_until_map, &cpu, &active_until, BPF_ANY);
@@ -305,7 +322,7 @@ static __always_inline bool resolve_tt_held(__u32 pid)
     __u32* held_cpu = bpf_map_lookup_elem(&tt_held_cpu_map, &pid);
     __u64* held_count;
 
-    if (!held_cpu || *held_cpu == TT_HELD_RETIRED)
+    if (!held_cpu || tt_held_is_retired(*held_cpu))
         return false;
     held_count = bpf_map_lookup_elem(&tt_held_count_map, held_cpu);
     if (!held_count || bpf_map_delete_elem(&tt_held_cpu_map, &pid) != 0)
@@ -314,25 +331,46 @@ static __always_inline bool resolve_tt_held(__u32 pid)
     return true;
 }
 
+static __always_inline bool finish_tt_revalidation(__u32 pid)
+{
+    __u32* held_cpu = bpf_map_lookup_elem(&tt_held_cpu_map, &pid);
+    __u64* retired_count;
+    __u32 cpu;
+
+    if (!held_cpu || !tt_held_is_retired(*held_cpu))
+        return false;
+    cpu = tt_held_retired_cpu(*held_cpu);
+    retired_count = bpf_map_lookup_elem(&tt_retired_count_map, &cpu);
+    if (!retired_count ||
+        bpf_map_delete_elem(&tt_held_cpu_map, &pid) != 0)
+        return false;
+    tt_runnable_decrement(retired_count);
+    return true;
+}
+
 static __always_inline bool retire_tt_held(__u32 pid)
 {
     __u32* held_cpu = bpf_map_lookup_elem(&tt_held_cpu_map, &pid);
     __u64* held_count;
     __u64* runnable_count;
+    __u64* retired_count;
     __u32 cpu;
-    __u32 retired = TT_HELD_RETIRED;
+    __u32 retired;
     __u64 inactive = 0;
 
-    if (!held_cpu || *held_cpu == TT_HELD_RETIRED)
+    if (!held_cpu || tt_held_is_retired(*held_cpu))
         return true;
     cpu = *held_cpu;
+    retired = TT_HELD_RETIRED_BASE | cpu;
     held_count = bpf_map_lookup_elem(&tt_held_count_map, &cpu);
     runnable_count = bpf_map_lookup_elem(&tt_runnable_count_map, &cpu);
-    if (!held_count || !runnable_count ||
+    retired_count = bpf_map_lookup_elem(&tt_retired_count_map, &cpu);
+    if (!held_count || !runnable_count || !retired_count ||
         bpf_map_update_elem(&tt_held_cpu_map, &pid, &retired, BPF_ANY) != 0)
         return false;
     tt_runnable_decrement(held_count);
     tt_runnable_decrement(runnable_count);
+    __sync_fetch_and_add(retired_count, 1);
     if (tt_runnable_load(runnable_count) == 0)
         bpf_map_update_elem(&tt_active_until_map, &cpu, &inactive, BPF_ANY);
     return true;
@@ -344,17 +382,20 @@ static __always_inline void cleanup_tt_held(__u32 pid)
 
     if (!held_cpu)
         return;
-    if (*held_cpu != TT_HELD_RETIRED) {
-        __u64* held_count = bpf_map_lookup_elem(&tt_held_count_map, held_cpu);
-        __u64* runnable_count =
-            bpf_map_lookup_elem(&tt_runnable_count_map, held_cpu);
-        __u64 inactive = 0;
-        tt_runnable_decrement(held_count);
-        tt_runnable_decrement(runnable_count);
-        if (tt_runnable_load(runnable_count) == 0)
-            bpf_map_update_elem(&tt_active_until_map, held_cpu, &inactive,
-                                BPF_ANY);
+    if (tt_held_is_retired(*held_cpu)) {
+        finish_tt_revalidation(pid);
+        return;
     }
+
+    __u64* held_count = bpf_map_lookup_elem(&tt_held_count_map, held_cpu);
+    __u64* runnable_count =
+        bpf_map_lookup_elem(&tt_runnable_count_map, held_cpu);
+    __u64 inactive = 0;
+    tt_runnable_decrement(held_count);
+    tt_runnable_decrement(runnable_count);
+    if (tt_runnable_load(runnable_count) == 0)
+        bpf_map_update_elem(&tt_active_until_map, held_cpu, &inactive,
+                            BPF_ANY);
     bpf_map_delete_elem(&tt_held_cpu_map, &pid);
 }
 
@@ -481,10 +522,18 @@ static __always_inline void release_held_tt_tasks(__u32 bank, __u32 cpu)
                 __sync_fetch_and_add(&tt_hold_failure_count, 1);
             }
         }
-        if (retire_tt_held(pid) &&
-            !scx_bpf_dispatch_from_dsq(&it, p, DSQ_TT_QUARANTINE, 0)) {
-            __sync_fetch_and_add(&tt_hold_failure_count, 1);
+        if (retire_tt_held(pid)) {
+            /* The SHM generation and task mapping are already published.
+             * Wake a removed task only so libttsched can revalidate that map;
+             * the wake must not become a TT job, and the task must leave the
+             * held queue before the update can be acknowledged. */
+            if (scx_bpf_dispatch_from_dsq(
+                    &it, p, SCX_DSQ_LOCAL_ON | cpu, SCX_ENQ_PREEMPT)) {
+                scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+                continue;
+            }
         }
+        __sync_fetch_and_add(&tt_hold_failure_count, 1);
     }
     bpf_iter_scx_dsq_destroy(&it);
 }
@@ -660,6 +709,7 @@ void BPF_PROG(running, struct task_struct* p)
     __u32 bank;
     struct TaskMeta* meta;
 
+    finish_tt_revalidation(pid);
     if (!acquire_current_bank(&bank))
         return;
     meta = lookup_task_meta(pid, bank);
@@ -834,9 +884,6 @@ s32 BPF_PROG(init)
         if (isolated_cpu_mask & (1ULL << cpu))
             scx_bpf_create_dsq(DSQ_TT_HELD_BASE + (__u32)cpu, -1);
     }
-    /* Quarantined removals are never dispatched; kernel task exit removes
-     * them from this private DSQ and exit_task clears their counters. */
-    scx_bpf_create_dsq(DSQ_TT_QUARANTINE, -1);
 
     return 0;
 }

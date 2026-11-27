@@ -57,6 +57,7 @@ struct TaskRecord {
     std::string workload_id;
     uint64_t workload_id_hash = 0;
     int32_t pid = -1;
+    uint32_t assigned_cpu = 0;
     uint32_t shm_index = 0;
 };
 
@@ -90,6 +91,7 @@ struct ActiveBaseline {
     uint32_t hyperperiod_us = 0;
     bool has_cpu = false;
     uint32_t cpu = 0;
+    std::set<uint32_t> cpus;
     std::vector<PreparedSlot> slots;
     std::map<uint64_t, TaskRecord> tasks;       // task_id_hash -> task
     std::map<uint64_t, std::string> workloads;  // workload_id_hash -> ID
@@ -101,6 +103,7 @@ struct NPrepared {
     uint32_t hyperperiod_us = 0;
     bool has_cpu = false;
     uint32_t cpu = 0;
+    std::set<uint32_t> cpus;
     // Sorted by (offset_ns, cpu, workload_id_hash, task_id_hash, slot_idx).
     std::vector<PreparedSlot> slots;
     std::map<uint64_t, TaskRecord> tasks;

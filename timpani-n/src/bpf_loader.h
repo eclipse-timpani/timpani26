@@ -124,6 +124,7 @@ private:
     void cleanup_old_bank(int old_bank);
     bool kick_tt_cpu(uint32_t cpu);
     bool tt_held_count(uint32_t cpu, uint64_t& count) const;
+    bool tt_retired_count(uint32_t cpu, uint64_t& count) const;
 
     int active_map_idx_;
     uint64_t isolated_cpu_mask_;

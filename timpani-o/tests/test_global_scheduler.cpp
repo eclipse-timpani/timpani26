@@ -4,7 +4,9 @@
  */
 
 #include <gtest/gtest.h>
+#include <map>
 #include <memory>
+#include <set>
 #include <variant>
 #include <vector>
 
@@ -319,6 +321,30 @@ TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperper
 
     ASSERT_EQ(cpu3_offsets.size(), 1u);
     EXPECT_EQ(cpu3_offsets[0], 0u);
+}
+
+TEST_F(GlobalSchedulerTest, PreservesPinnedTtWorkloadCpuWhenAssigningNewWork)
+{
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("retained", "retained_task", 10000, 1000, 2000),
+        MakeTtTask("new_work", "new_task", 5000, 1000, 2000),
+    };
+    tasks[0].assigned_cpu = 3;
+
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+    const auto& table = GetTable(result);
+
+    std::map<std::string, std::set<uint32_t>> cpus;
+    for (const auto& partition : table.partitions()) {
+        ASSERT_EQ(partition.cpuset().cpus_size(), 1);
+        for (const auto& layer : partition.layers()) {
+            for (const auto& slot : layer.tt_slots())
+                cpus[slot.workload_id()].insert(partition.cpuset().cpus(0));
+        }
+    }
+    EXPECT_EQ(cpus["retained"], (std::set<uint32_t>{3}));
+    EXPECT_EQ(cpus["new_work"], (std::set<uint32_t>{2}));
 }
 
 TEST_F(GlobalSchedulerTest, UnrolledSlotsExceedingNodeCapacityFails) {

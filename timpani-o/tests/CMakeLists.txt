@@ -63,6 +63,7 @@ add_executable(test_runtime_table_update
 )
 target_compile_definitions(test_runtime_table_update PRIVATE
     PHASE0_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/phase0_node.yaml"
+    PHASE0_TWO_CPU_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/phase0_node_two_cpu.yaml"
     MULTI_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/node_configurations.yaml"
 )
 target_link_libraries(test_runtime_table_update

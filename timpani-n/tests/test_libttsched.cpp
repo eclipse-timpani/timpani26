@@ -437,6 +437,29 @@ TEST_F(TtschedShmTest, RemovedOrClearedTaskGetsRemoved)
     }
 }
 
+TEST_F(TtschedShmTest, RemovedTaskCanBeReadded)
+{
+    publish({"other", "self"});
+    ttsched_snapshot removed = read("self");
+    ASSERT_TRUE(removed.valid);
+    ASSERT_EQ(removed.idx, 1);
+
+    ScriptedWait remove_wait;
+    remove_wait.events = {[this] { publish({"other"}); }};
+    EXPECT_EQ(wait(remove_wait, removed), TTSCHED_WAKE_REMOVED);
+    EXPECT_EQ(read("self").idx, -1);
+
+    publish({"other", "self"});
+    ttsched_snapshot readded = read("self");
+    ASSERT_TRUE(readded.valid);
+    ASSERT_EQ(readded.idx, 1);
+
+    ScriptedWait readd_wait;
+    readd_wait.events = {[this] { fire(1); }};
+    EXPECT_EQ(wait(readd_wait, readded), TTSCHED_WAKE_JOB);
+    EXPECT_EQ(readd_wait.calls.size(), 1u);
+}
+
 TEST_F(TtschedShmTest, ReusedSlotWakeIsNotConsumed)
 {
     raw_.tasks[2].counter = 5;

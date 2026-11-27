@@ -85,9 +85,12 @@ The driver performs these ordered checks:
 2. `REPLACE` them with W1 and W3.
 3. `ADD` and reject the absent-task workload W4.
 4. `REMOVE` W2/W3 according to the active fixture.
-5. `CLEAR` the candidate while preserving epoch and hyperperiod.
-6. Rebuild a table from the remaining fixture workloads.
-7. Verify that operations submitted during an in-flight update are rejected.
+5. Re-`ADD` the same surviving workload/process and verify that its task PID and
+   container identity are unchanged and job progress resumes.
+6. `REMOVE` that workload again, then `CLEAR` the candidate while preserving
+   epoch and hyperperiod.
+7. Rebuild a table from the remaining fixture workloads.
+8. Verify that operations submitted during an in-flight update are rejected.
 
 Stop after the first fatal protocol failure. A failed application, missing ACK,
 unexpected node disconnect, non-deterministic workload set, or stale bank
@@ -106,7 +109,9 @@ Collect the following artifacts from the same run:
   detection and scheduler attach status.
 - Perfetto and gpdata artifacts that show retained TT slots remain on the fixed
   grid across the update.
-- Sample-app runtime/deadline output and the target test summary.
+- Sample-app runtime/deadline output and the target test summary, including
+  removed-task control-wake evidence and a REMOVE -> ADD -> new-job sequence for
+  the same surviving PID/container.
 
 Host tests alone do not approve target timing, kernel memory ordering, BPF
 verifier behavior, or first-job wake correctness. Record those results as
@@ -116,6 +121,7 @@ separate evidence.
 
 Phase 0 is complete for review only when every normal operation in the target
 sequence succeeds, rejected operations leave the confirmed baseline unchanged,
-all host tests pass, no held task executes from an old table, and no old BPF bank
-is cleared while referenced. The evidence must identify the exact commit and
+all host tests pass, no held task executes from an old table, removed held tasks
+leave their private queue and can be re-added without restarting, and no old BPF
+bank is cleared while referenced. The evidence must identify the exact commit and
 record that the work remains target-validation material, not a safety approval.

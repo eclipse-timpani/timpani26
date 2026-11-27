@@ -51,6 +51,25 @@ Slots workload_slots(const timpani::node::v1::HierarchicalScheduleTable& table,
     return result;
 }
 
+bool retained_task_cpu(
+    const timpani::node::v1::HierarchicalScheduleTable& table,
+    const std::string& workload, const std::string& task, int& cpu)
+{
+    bool found = false;
+    for (const auto& partition : table.partitions()) {
+        for (const auto& layer : partition.layers()) {
+            for (const auto& slot : layer.tt_slots()) {
+                if (slot.workload_id() != workload || slot.task_id() != task)
+                    continue;
+                if (found && cpu != static_cast<int>(slot.cpu())) return false;
+                cpu = static_cast<int>(slot.cpu());
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
 bool same_parameters(const SchedInfo& left, const SchedInfo& right)
 {
     std::map<std::string, std::string> a;
@@ -138,13 +157,18 @@ bool SchedInfoServer::EnablePhase0(timpani::orchestrator::OrchestratorServiceImp
         return false;
     }
     const auto& [node_id, node] = *config->GetAllNodes().begin();
-    if (node_id.empty() || node.available_cpus.size() != 1 || node.available_cpus.front() < 0) {
-        TLOG_ERROR("[RTU-P0] enable rejected: one configured isolated CPU is required");
+    auto cpus = node.available_cpus;
+    std::sort(cpus.begin(), cpus.end());
+    if (node_id.empty() || cpus.empty() ||
+        std::any_of(cpus.begin(), cpus.end(), [](int cpu) {
+            return cpu < 0 || cpu >= 64;
+        }) || std::adjacent_find(cpus.begin(), cpus.end()) != cpus.end()) {
+        TLOG_ERROR("[RTU-P0] enable rejected: configured isolated CPUs must be unique and within 0..63");
         return false;
     }
     auto state = std::make_shared<SchedInfoServiceImpl::Phase0State>();
     state->node_id = node_id;
-    state->cpu = node.available_cpus.front();
+    state->cpus = cpus;
     // Callbacks share only the state, not the service lifetime.
     orchestrator.phase0_node_id_ = node_id;
     orchestrator.phase0_ack_ = [state](const auto& node, const auto& ack) {
@@ -155,7 +179,12 @@ bool SchedInfoServer::EnablePhase0(timpani::orchestrator::OrchestratorServiceImp
     };
     service_.phase0_ = std::move(state);
     phase0_orchestrator_ = &orchestrator;
-    TLOG_INFO("[RTU-P0] enabled node_id=", node_id, " cpu=", node.available_cpus.front());
+    std::string cpu_list;
+    for (size_t i = 0; i < cpus.size(); ++i) {
+        if (i != 0) cpu_list += ',';
+        cpu_list += std::to_string(cpus[i]);
+    }
+    TLOG_INFO("[RTU-P0] enabled node_id=", node_id, " cpus=", cpu_list);
     return true;
 }
 
@@ -250,6 +279,18 @@ bool SchedInfoServiceImpl::ValidatePhase0Workloads(
             classified.wcet_us = static_cast<uint32_t>(task.runtime());
             classified.deadline_us = static_cast<uint32_t>(task.deadline());
             classified.max_dmiss = static_cast<uint32_t>(task.max_dmiss());
+            if (phase0_->confirmed) {
+                const auto retained = phase0_->confirmed->workloads.find(id);
+                if (retained != phase0_->confirmed->workloads.end()) {
+                    int retained_cpu = -1;
+                    if (!retained_task_cpu(phase0_->confirmed->table, id,
+                                           task.name(), retained_cpu)) {
+                        error = "retained task has no stable CPU assignment";
+                        return false;
+                    }
+                    classified.assigned_cpu = retained_cpu;
+                }
+            }
             tasks.push_back(std::move(classified));
             hyperperiod = std::max(hyperperiod, static_cast<uint32_t>(task.period()));
         }
@@ -275,9 +316,14 @@ bool SchedInfoServiceImpl::ValidatePhase0Table(const Phase0Table& table, std::st
     }
     size_t slots = 0;
     for (const auto& partition : table.partitions()) {
-        if (!partition.cpuset().isolated() || partition.cpuset().cpus_size() != 1 ||
-            partition.cpuset().cpus(0) != static_cast<uint32_t>(phase0_->cpu)) {
-            error = "generated table changes the isolated CPU";
+        if (!partition.cpuset().isolated() || partition.cpuset().cpus_size() != 1) {
+            error = "generated table must contain one isolated CPU per partition";
+            return false;
+        }
+        const int partition_cpu = static_cast<int>(partition.cpuset().cpus(0));
+        if (!std::binary_search(phase0_->cpus.begin(), phase0_->cpus.end(),
+                                partition_cpu)) {
+            error = "generated table changes the isolated CPU set";
             return false;
         }
         for (const auto& layer : partition.layers()) {
@@ -289,8 +335,8 @@ bool SchedInfoServiceImpl::ValidatePhase0Table(const Phase0Table& table, std::st
             for (const auto& slot : layer.tt_slots()) {
                 if (slot.duration_us() == 0 || slot.deadline_us() == 0 ||
                     uint64_t{slot.offset_us()} + slot.duration_us() > h ||
-                    slot.cpu() != static_cast<uint32_t>(phase0_->cpu)) {
-                    error = "generated slot is outside the fixed grid";
+                    slot.cpu() != partition.cpuset().cpus(0)) {
+                    error = "generated slot is outside its partition's fixed grid";
                     return false;
                 }
                 ++slots;
@@ -309,8 +355,10 @@ bool SchedInfoServiceImpl::PreparePhase0Candidate(
     const std::vector<std::string>& removals, OAttempt& attempt, std::string& error)
 {
     auto& state = *phase0_;
+    auto configured_cpus = node_config_manager_->GetAvailableCpus(state.node_id);
+    std::sort(configured_cpus.begin(), configured_cpus.end());
     if (node_config_manager_->GetAllNodes().size() != 1 ||
-        node_config_manager_->GetAvailableCpus(state.node_id) != std::vector<int>{state.cpu}) {
+        configured_cpus != state.cpus) {
         error = "node/CPU configuration changed during the trial";
         return false;
     }

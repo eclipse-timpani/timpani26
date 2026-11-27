@@ -220,13 +220,15 @@ The default path is unchanged: CBS, multiple nodes and the existing replay/retry
 behavior remain available. Enable the separate Phase 0 path explicitly:
 
 ```bash
-# Edit the node ID and isolated CPU in this example before a target trial.
+# Edit the node ID and isolated CPU set in this example before a target trial.
 ./build/timpani-o --runtime-table-update-phase0 -c examples/phase0_node.yaml
 ```
 
-Phase 0 requires one configured node, one already isolated CPU, L1 TT only,
-and an ACK-confirmed fixed epoch/hyperperiod. It does not configure OS affinity.
-Connect N and pre-register trial processes before submitting the baseline.
+Phase 0 requires one configured node, a fixed non-empty set of already isolated
+CPUs, L1 TT only, and an ACK-confirmed fixed epoch/hyperperiod. Each task stays
+on one CPU; retained tasks keep their existing CPU. Phase 0 does not configure
+OS affinity. Connect N and pre-register trial processes before submitting the
+baseline.
 
 - `AddSchedInfo.status=0` means candidate acceptance, not application. The
   existing non-RT main loop sends the candidate once through `full_table`.
@@ -241,8 +243,9 @@ Connect N and pre-register trial processes before submitting the baseline.
   confirmed H; generated slots are repeated over H instead of overwriting it.
   A multiple or non-divisor H is rejected. CLEAR preserves E/H for later ADDs.
 - Limits: 32 unique tasks, 2048 slots, ASCII workload/task IDs of 1..15 bytes.
-  CBS, MODIFY, multiple nodes/CPUs, changed E/H/CPU and reused task identities
-  across workloads are outside Phase 0.
+  Multiple CPUs are supported when they belong to the configured isolated CPU
+  set. CBS, MODIFY, multiple nodes, cross-core migration, changed E/H/CPU and
+  reused task identities across workloads are outside Phase 0.
 - Write failure, disconnect, unexpected ACK or recovery STOP stops subsequent
   submissions until an externally re-established fresh trial. Existing fault
   reporting and STOP forwarding stay enabled; STOP preserves the last confirmed
