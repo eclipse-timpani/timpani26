@@ -5,6 +5,7 @@
 add_executable(timpani-o
   main.cpp
   schedinfo_service.cpp
+  phase0_runtime.cpp
   fault_client.cpp
   node_config.cpp
   global_scheduler.cpp

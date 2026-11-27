@@ -6,12 +6,14 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "bpf_loader.h"
+#include "phase0_handover.h"
 
 // SHM layout shared with libttsched (C header — include as C struct)
 extern "C" {
@@ -45,6 +47,16 @@ class TimerMaster
     void stop();
 
     void remove_workload(uint64_t workload_id_hash);
+
+    // DDR-011 Phase 0: call before start(). start() then runs one resident
+    // RT thread that is never restarted, and set_schedule_table() and
+    // remove_workload() are refused.
+    bool enable_phase0();
+    // Non-RT. Stages @prepared in the inactive BPF bank and hands it over at
+    // the earliest feasible boundary T = E + kH (L-P0-04). Blocks until it
+    // is applied at T or rejected before any active state changed.
+    bool apply_phase0_table(const phase0::NPrepared& prepared,
+                            phase0::ApplyResult& result);
 
   private:
     /* Per-CPU timer loop: each CPU gets its own thread running only its slots */
@@ -81,6 +93,20 @@ class TimerMaster
     uint64_t epoch_ns_;
     std::mutex schedule_mutex_;
     std::recursive_mutex lifecycle_mutex_;
+
+    void phase0_loop();
+
+    // DDR-011 Phase 0. phase0_state_ is shared with the resident RT thread;
+    // the rest is used by apply_phase0_table() under phase0_mutex_.
+    bool phase0_ = false;
+    bool phase0_failed_ = false;
+    uint64_t phase0_token_ = 0;
+    phase0::HandoverState phase0_state_;
+    phase0::ShmOwners phase0_owners_;
+    std::unique_ptr<phase0::Context> phase0_active_;
+    // Published to the RT thread but not adopted (yet).
+    std::unique_ptr<phase0::Context> phase0_pending_;
+    std::mutex phase0_mutex_;
 };
 
 }  // namespace node

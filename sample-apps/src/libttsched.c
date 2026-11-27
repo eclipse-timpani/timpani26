@@ -14,64 +14,101 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "ttsched_shm.h"
+
+#define TTSCHED_WAIT_RECHECK_NS 100000000L
+
 static __thread volatile struct timpani_ttsched_shm* g_shm = NULL;
-static __thread int g_task_idx = -1; /* index into g_shm->tasks[], -1 = not found yet */
-static __thread uint32_t g_shm_generation = 0;
+static __thread char g_name[TTSCHED_NAME_LEN]; /* PR_GET_NAME of this thread */
 static __thread int g_has_releases;
 static __thread struct timpani_tt_completion g_job;
 
 _Static_assert(TIMPANI_TT_COMPLETE_OP == (FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG),
                "TT completion must use a private futex wake");
 
-static int schedule_is_current(void)
+static void load_task_name(void)
 {
-    return __atomic_load_n(&g_shm->magic, __ATOMIC_ACQUIRE) == TIMPANI_TTSCHED_MAGIC &&
-           __atomic_load_n(&g_shm->generation, __ATOMIC_ACQUIRE) == g_shm_generation;
+    memset(g_name, 0, sizeof(g_name));
+    prctl(PR_GET_NAME, g_name, 0, 0, 0);
+    g_name[TTSCHED_NAME_LEN - 1] = '\0';
 }
 
-static int find_task_slot(volatile struct timpani_ttsched_shm* shm,
-                          const char* name)
+static void unmap_shm(void)
 {
-    uint32_t n, i;
-
-    if (shm->magic != TIMPANI_TTSCHED_MAGIC) return -1;
-
-    n = shm->n_tasks;
-    for (i = 0; i < n && i < TIMPANI_MAX_TASKS; i++) {
-        if (strncmp((const char*)shm->tasks[i].name, name, 15) == 0)
-            return (int)i;
+    if (g_shm) {
+        munmap((void*)g_shm, sizeof(struct timpani_ttsched_shm));
+        g_shm = NULL;
     }
-    return -1;
 }
 
 void ttsched_init(void)
 {
-    int fd = shm_open("/timpani_ttsched", O_RDONLY, 0666);
+    int fd;
+    void* addr;
+
+    unmap_shm();
+    /* The slot itself is looked up on every wait: the schedule may not be
+     * published yet. */
+    load_task_name();
+    fd = shm_open("/timpani_ttsched", O_RDONLY, 0666);
     if (fd < 0) return;
 
     struct stat status;
-    g_has_releases = fstat(fd, &status) == 0 && status.st_size >= (off_t)sizeof(*g_shm);
-    g_shm = (volatile struct timpani_ttsched_shm*)mmap(
-        NULL, sizeof(struct timpani_ttsched_shm), PROT_READ, MAP_SHARED, fd, 0);
+    g_has_releases =
+        fstat(fd, &status) == 0 &&
+        status.st_size >= (off_t)sizeof(struct timpani_ttsched_shm);
+    addr = mmap(NULL, sizeof(struct timpani_ttsched_shm), PROT_READ, MAP_SHARED,
+                fd, 0);
     close(fd);
+    if (addr != MAP_FAILED) g_shm = (volatile struct timpani_ttsched_shm*)addr;
+}
 
-    if (g_shm == MAP_FAILED) {
-        g_shm = NULL;
-        return;
-    }
+static int wait_counter(const volatile uint32_t* word, uint32_t expected,
+                        void* ctx)
+{
+    static const struct timespec recheck = {
+        .tv_sec = 0,
+        .tv_nsec = TTSCHED_WAIT_RECHECK_NS,
+    };
 
-    /* Slot lookup: schedule may not be ready yet — retry in wait_next_period */
-    char my_name[16] = {};
-    prctl(PR_GET_NAME, my_name, 0, 0, 0);
-    g_task_idx = find_task_slot(g_shm, my_name);
-    g_shm_generation = g_shm->generation;
+    (void)ctx;
+    if (syscall(SYS_futex, (uint32_t*)word, FUTEX_WAIT, expected, &recheck,
+                NULL, 0) == 0)
+        return 0;
+    /* EAGAIN means the counter changed, EINTR is a signal and ETIMEDOUT is
+     * the periodic publication/mapping re-check. None is a job by itself. */
+    return errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT ? 0 : -1;
+}
+
+static int load_release_deadline(const struct ttsched_snapshot* snap,
+                                 uint64_t* deadline)
+{
+    const volatile struct timpani_tt_release* release;
+    uint32_t before;
+    uint32_t counter;
+    uint32_t after;
+
+    if (!g_has_releases || !snap->valid || snap->idx < 0 ||
+        snap->idx >= (int)TIMPANI_MAX_TASKS)
+        return 0;
+
+    release = &g_shm->releases[snap->idx];
+    before = __atomic_load_n(&release->version, __ATOMIC_SEQ_CST);
+    counter = __atomic_load_n(&release->counter, __ATOMIC_SEQ_CST);
+    *deadline = __atomic_load_n(&release->deadline_ns, __ATOMIC_SEQ_CST);
+    after = __atomic_load_n(&release->version, __ATOMIC_SEQ_CST);
+
+    return !(before & 1u) && before == after && counter == snap->counter &&
+           ttsched_shm_read_validate(g_shm, snap->generation);
 }
 
 int ttsched_wait_next_period(void)
 {
-    uint32_t current;
+    struct ttsched_snapshot snap;
+    int ready = 0;
 
     if (g_job.deadline_ns) {
         syscall(SYS_futex, &g_job, TIMPANI_TT_COMPLETE_OP, 1, NULL, NULL,
@@ -79,74 +116,44 @@ int ttsched_wait_next_period(void)
         g_job.deadline_ns = 0;
     }
 
+    if (g_shm) {
+        ready = ttsched_shm_read(g_shm, g_name, &snap);
+        /* magic 0: timpani-n stopped, restarted or is publishing. Map the
+         * current object again so that a re-created SHM is picked up. */
+        if (!ready && !snap.magic_ok) unmap_shm();
+    }
     if (!g_shm) {
-        /* SHM not mapped yet — retry open/map on every call */
         ttsched_init();
-        if (!g_shm) {
-            usleep(1000);
-            return -1;
-        }
+        if (g_shm) ready = ttsched_shm_read(g_shm, g_name, &snap);
+    }
+    if (!ready || snap.idx < 0) {
+        /* Not published, being published, removed or cleared. */
+        if (ready) load_task_name();
+        usleep(1000);
+        return -1;
     }
 
-    /* Detect timpani-n restart: magic is zeroed by TimerMaster before it
-     * publishes a new schedule table (or remains 0 after shm_unlink +
-     * re-create).  Re-init to pick up the new SHM object. */
-    if (g_shm->magic != TIMPANI_TTSCHED_MAGIC) {
-        /* Unmap stale SHM and re-open the (possibly new) object */
-        munmap((void*)g_shm, sizeof(struct timpani_ttsched_shm));
-        g_shm = NULL;
-        g_task_idx = -1;
-        ttsched_init();
-        if (!g_shm) {
-            usleep(1000);
-            return -1;
-        }
-        /* If still not ready (magic still 0), wait for schedule publish */
-        if (g_shm->magic != TIMPANI_TTSCHED_MAGIC) {
-            usleep(1000);
-            return -1;
-        }
-    }
-
-    /* Detect schedule table update via generation counter */
-    if (g_shm->generation != g_shm_generation) {
-        g_shm_generation = g_shm->generation;
-        g_task_idx = -1;
-    }
-
-    /* Retry slot lookup if schedule arrived after ttsched_init() */
-    if (g_task_idx < 0) {
-        char my_name[16] = {};
-        prctl(PR_GET_NAME, my_name, 0, 0, 0);
-        g_task_idx = find_task_slot(g_shm, my_name);
-        if (g_task_idx < 0) {
-            usleep(1000);
-            return -1;
-        }
-    }
-
-    volatile uint32_t* counter = &g_shm->tasks[g_task_idx].counter;
-    current = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+    /* Only an advance of this task's own counter in a stable publication is
+     * a job. Publication, control and signal wakes are re-checked. */
     for (;;) {
-        if (!schedule_is_current()) return -1;
-        uint32_t observed = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
-        if (!schedule_is_current()) return -1;
-        if (observed != current) {
+        enum ttsched_wake wake =
+            ttsched_shm_wait(g_shm, g_name, &snap, wait_counter, NULL);
+        if (wake == TTSCHED_WAKE_JOB) {
+            uint64_t deadline = 0;
             if (!g_has_releases) return 0;
-
-            const volatile struct timpani_tt_release* release = &g_shm->releases[g_task_idx];
-            uint32_t version = __atomic_load_n(&release->version, __ATOMIC_SEQ_CST);
-            uint32_t job_counter = __atomic_load_n(&release->counter, __ATOMIC_SEQ_CST);
-            uint64_t deadline = __atomic_load_n(&release->deadline_ns, __ATOMIC_SEQ_CST);
-            if (!schedule_is_current()) return -1;
-            if (!(version & 1u) && job_counter == observed &&
-                version == __atomic_load_n(&release->version, __ATOMIC_SEQ_CST)) {
+            if (load_release_deadline(&snap, &deadline)) {
                 g_job.deadline_ns = deadline;
                 return 0;
             }
+            /* Counter-only wake-ups from a table publication are not jobs. */
+            if (!ttsched_shm_read(g_shm, g_name, &snap) || snap.idx < 0) {
+                if (!snap.magic_ok) unmap_shm();
+                return -1;
+            }
+            continue;
         }
-        if (syscall(SYS_futex, (uint32_t*)counter, FUTEX_WAIT, observed,
-                    NULL, NULL, 0) == -1 && errno != EINTR && errno != EAGAIN)
-            return -1;
+        if (wake == TTSCHED_WAKE_FAILED) usleep(1000);
+        if (!snap.magic_ok) unmap_shm();
+        return -1;
     }
 }

@@ -215,6 +215,13 @@ podman-compose up -d
 | **Timer** | `-t` | Internal timer-based periodic execution. Standalone operation. |
 | **Signal** | (default) | Waits for external SIGRTMIN+2 signal. |
 
+In BPF mode, `ttsched_wait_next_period()` returns `0` only when this task's own
+slot counter advanced in a stable `/timpani_ttsched` publication (even
+`generation`, valid `magic`). It returns `-1` while timpani-n is publishing,
+stopped, or restarting, and while the task is not published (for example
+after removal or CLEAR). Wakes without a counter advance are not run as jobs.
+Use libttsched with a timpani-n that publishes even generations.
+
 ---
 
 ## Development

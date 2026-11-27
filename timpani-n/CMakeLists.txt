@@ -54,6 +54,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # BPF build option
 option(CONFIG_TRACE_BPF "Enable eBPF sched_ext scheduler" ON)
 option(CONFIG_TRACE_BPF_EVENT "Enable eBPF schedstat tracing for gpdata output" OFF)
+option(BUILD_TESTS "Build unit tests" OFF)
 set(TIMPANI_KERNEL_BTF_FILE "/sys/kernel/btf/vmlinux" CACHE FILEPATH
     "BTF ELF file for the kernel targeted by the sched_ext BPF build")
 set(TIMPANI_SCX_API "AUTO" CACHE STRING
@@ -229,6 +230,9 @@ set(TIMPANI_N_SOURCES
     src/bpf_loader.cpp
     src/fault_monitor.cpp
     src/task_registry.cpp
+    src/phase0_prepare.cpp
+    src/phase0_handover.cpp
+    src/phase0_attempt.cpp
     src/grpc/node_client.cpp
     ${NODE_CONTROL_PROTO_SRC}
     ${NODE_CONTROL_GRPC_SRC}
@@ -272,6 +276,113 @@ target_include_directories(timpani-n
     PUBLIC ${CMAKE_SOURCE_DIR}/src
     PUBLIC ${CMAKE_BINARY_DIR}
 )
+
+# Unit tests. Defined here, not in a subdirectory, so they can reuse the
+# generated node_control protobuf sources. They need neither BPF nor gRPC.
+if(BUILD_TESTS)
+    enable_testing()
+    find_package(GTest REQUIRED)
+
+    add_executable(test_phase0_prepare
+        tests/test_phase0_prepare.cpp
+        src/phase0_prepare.cpp
+        ${NODE_CONTROL_PROTO_SRC}
+    )
+    target_include_directories(test_phase0_prepare PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_phase0_prepare
+        GTest::gtest
+        GTest::gtest_main
+        protobuf::libprotobuf
+        pthread
+    )
+    if(NOT APPLE)
+        target_link_libraries(test_phase0_prepare rt)
+    endif()
+
+    add_test(NAME Phase0PrepareTest COMMAND test_phase0_prepare)
+    set_tests_properties(Phase0PrepareTest PROPERTIES TIMEOUT 30)
+
+    # P0-T03: bank routing / handover / staging state machine. Header-only
+    # free functions, so no BPF, libbpf, or protobuf dependency.
+    add_executable(test_bpf_loader
+        tests/test_bpf_loader.cpp
+    )
+    target_include_directories(test_bpf_loader PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_bpf_loader
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+    )
+
+    add_test(NAME BpfLoaderBankTest COMMAND test_bpf_loader)
+    set_tests_properties(BpfLoaderBankTest PROPERTIES TIMEOUT 30)
+
+    # P0-T05: /timpani_ttsched publication protocol shared by TimerMaster and
+    # libttsched. Header-only, so no futex, BPF, or protobuf dependency.
+    add_executable(test_libttsched
+        tests/test_libttsched.cpp
+    )
+    target_link_libraries(test_libttsched
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+    )
+
+    add_test(NAME TtschedShmTest COMMAND test_libttsched)
+    set_tests_properties(TtschedShmTest PROPERTIES TIMEOUT 30)
+
+    # P0-T04: boundary handover between the coordinator and the resident RT
+    # engine, and the SHM writer. Kernel and clock access are injected.
+    add_executable(test_phase0_handover
+        tests/test_phase0_handover.cpp
+        src/phase0_handover.cpp
+        ${NODE_CONTROL_PROTO_SRC}
+    )
+    target_include_directories(test_phase0_handover PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_phase0_handover
+        GTest::gtest
+        GTest::gtest_main
+        protobuf::libprotobuf
+        pthread
+    )
+
+    add_test(NAME Phase0HandoverTest COMMAND test_phase0_handover)
+    set_tests_properties(Phase0HandoverTest PROPERTIES TIMEOUT 60)
+
+    # P0-T06: one attempt on the main non-RT loop and its ACK decision.
+    # TimerMaster, BPF, SHM and FaultMonitor access is injected.
+    add_executable(test_phase0_attempt
+        tests/test_phase0_attempt.cpp
+        src/phase0_attempt.cpp
+        src/phase0_prepare.cpp
+        ${NODE_CONTROL_PROTO_SRC}
+    )
+    target_include_directories(test_phase0_attempt PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_phase0_attempt
+        GTest::gtest
+        GTest::gtest_main
+        protobuf::libprotobuf
+        pthread
+    )
+    if(NOT APPLE)
+        target_link_libraries(test_phase0_attempt rt)
+    endif()
+
+    add_test(NAME Phase0AttemptTest COMMAND test_phase0_attempt)
+    set_tests_properties(Phase0AttemptTest PROPERTIES TIMEOUT 30)
+endif()
 
     # ============================================================================
     # Installation

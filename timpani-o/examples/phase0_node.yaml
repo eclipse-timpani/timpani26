@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+# SPDX-License-Identifier: MIT
+
+# Adjust node1 and CPU 2 to the already configured target node and isolated CPU.
+nodes:
+  node1:
+    available_cpus: [2]
+    max_memory_mb: 4096
+    architecture: "aarch64"
+    description: "Opt-in Phase 0 single-node TT fixture"

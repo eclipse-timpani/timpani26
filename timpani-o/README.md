@@ -200,6 +200,7 @@ make test
 ./tests/test_fault_client
 ./tests/test_global_scheduler
 ./tests/test_node_config
+./tests/test_runtime_table_update
 ```
 
 **Test prerequisites:**
@@ -210,6 +211,76 @@ sudo apt install -y libgtest-dev
 # CentOS
 sudo dnf install -y gtest-devel
 ```
+
+---
+
+## Opt-in Phase 0 runtime table updates
+
+The default path is unchanged: CBS, multiple nodes and the existing replay/retry
+behavior remain available. Enable the separate Phase 0 path explicitly:
+
+```bash
+# Edit the node ID and isolated CPU set in this example before a target trial.
+./build/timpani-o --runtime-table-update-phase0 -c examples/phase0_node.yaml
+```
+
+Phase 0 requires one configured node, a fixed non-empty set of already isolated
+CPUs, L1 TT only, and an ACK-confirmed fixed epoch/hyperperiod. Each task stays
+on one CPU; retained tasks keep their existing CPU. Phase 0 does not configure
+OS affinity. Connect N and pre-register trial processes before submitting the
+baseline.
+
+- `AddSchedInfo.status=0` means candidate acceptance, not application. The
+  existing non-RT main loop sends the candidate once through `full_table`.
+- Normal `RemoveWorkload` submits a removal candidate. REPLACE/CLEAR use private
+  O test/control helpers, not new RPCs. All four operations use O's generator.
+- Confirmed inputs and tables change only after a matching successful
+  `(node_id, table_id)` ACK. `GetScheduleTables` exposes confirmed tables only.
+  Generation failure and a matching negative ACK leave them unchanged.
+- Only one attempt is retained, including while awaiting its first connection.
+  Further requests are rejected immediately; no queue, merge, retry or replay.
+- ADD/REMOVE preserve retained slots. A candidate minimum LCM must divide the
+  confirmed H; generated slots are repeated over H instead of overwriting it.
+  A multiple or non-divisor H is rejected. CLEAR preserves E/H for later ADDs.
+- Limits: 32 unique tasks, 2048 slots, ASCII workload/task IDs of 1..15 bytes.
+  Multiple CPUs are supported when they belong to the configured isolated CPU
+  set. CBS, MODIFY, multiple nodes, cross-core migration, changed E/H/CPU and
+  reused task identities across workloads are outside Phase 0.
+- Write failure, disconnect, unexpected ACK or recovery STOP stops subsequent
+  submissions until an externally re-established fresh trial. Existing fault
+  reporting and STOP forwarding stay enabled; STOP preserves the last confirmed
+  O model rather than pretending to complete a normal REMOVE.
+
+The two opt-in C++ connection methods are `SchedInfoServer::EnablePhase0` and
+`PushPendingTables`. Enable before either gRPC server starts; the orchestrator
+must outlive the SchedInfo server. No existing public method, proto or SHM ABI is
+removed or changed. Default container/Compose configuration is unchanged.
+
+Run the focused suite with
+`ctest --test-dir build -R '^RuntimeTableUpdateTest$' --output-on-failure`.
+It uses the plan's W1/W2/W3 fixture and real local gRPC streams/ACKs, and checks
+both opt-in invariants and default CBS/delta behavior.
+
+`test_phase0_e2e` is the target E2E driver (P0-T06). It acts as timpani-o for
+one real timpani-n and runs the plan's REPLACE, ADD, REMOVE, CLEAR, rejection
+and busy sequence through `full_table`. CTest reports it as skipped unless
+`TIMPANI_P0_E2E=1` is set:
+
+```bash
+TIMPANI_P0_E2E=1 ./build/tests/test_phase0_e2e
+```
+
+The driver listens on `TIMPANI_P0_E2E_PORT` (default 50060) and loads
+`TIMPANI_P0_E2E_NODE_CONFIG` (default `examples/phase0_node.yaml`). It waits up
+to `TIMPANI_P0_E2E_CONNECT_S` (60) seconds for the node and up to
+`TIMPANI_P0_E2E_ACK_TIMEOUT_S` (10) seconds for each ACK. It runs
+`TIMPANI_P0_E2E_ROUNDS` (3) rounds. Start the sample apps and
+`timpani-n --runtime-table-update-phase0` first, and restart timpani-n before
+each run.
+
+timpani-n acknowledges a table only after the boundary switch and the old-state
+cleanup (P0-T06). Host and mock-node results do not prove BPF/SHM activation;
+Linux target evidence is still required.
 
 ---
 
@@ -233,4 +304,3 @@ podman login sdv.lge.com
 podman tag timpani-o:latest sdv.lge.com/timpani/timpani-o:v0.1.0
 podman push sdv.lge.com/timpani/timpani-o:v0.1.0
 ```
-

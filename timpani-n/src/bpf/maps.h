@@ -72,6 +72,35 @@ struct FaultEvent {
     __u8  fault_type;
 };
 
+/*
+ * KernelControl — 2-bank handover state, placed in .bss by the BPF program
+ * and written by BpfLoader (userspace) via the skeleton bss map.
+ *
+ *   active_bank_idx   : 0 or 1 — which bank the BPF program reads from.
+ *                       BpfLoader writes the shadow bank index here as the
+ *                       single atomic handover step (D-02).
+ *   tt_handover_gate  : 1 while a handover is in progress. BPF enqueue()
+ *                       holds new TT activations on their assigned-CPU
+ *                       private queues while the gate is set; CBS and
+ *                       best-effort dispatches are unaffected.
+ *   bank_active_refs  : per-bank callback reference count. Each banked
+ *                       callback acquires and revalidates one reference
+ *                       before its lookups and releases it on every return.
+ *                       The old bank is cleaned only after its ref count
+ *                       reaches 0 after the handover.
+ *
+ * All fields are volatile: the BPF program reads them, userspace writes
+ * them. Not `volatile const` — D-02 requires userspace-writable .bss.
+ */
+struct KernelControl {
+    volatile __u32 active_bank_idx;
+    volatile __u32 tt_handover_gate;
+    /* 64-bit: the BPF target has no 32-bit atomic patterns, so the
+     * callback-wide __sync_fetch_and_add/sub requires a 64-bit operand
+     * (clang -target bpf crashes on s32). */
+    volatile __u64 bank_active_refs[2];
+};
+
 #ifdef __cplusplus
 }
 #endif

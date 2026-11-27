@@ -23,11 +23,19 @@
 #include "recovery_service.h"
 #include "tlog.h"
 
+std::unique_ptr<grpc::Server> g_orchestrator_server;
+std::unique_ptr<timpani::orchestrator::OrchestratorServiceImpl>
+    g_orchestrator_service;
+
 bool RunSchedInfoServer(int port, std::unique_ptr<SchedInfoServer>& server,
                         std::shared_ptr<NodeConfigManager> node_config_manager,
-                        std::unique_ptr<RecoveryServiceImpl>& recovery_service)
+                        std::unique_ptr<RecoveryServiceImpl>& recovery_service,
+                        bool phase0)
 {
     server = std::make_unique<SchedInfoServer>(node_config_manager);
+    if (phase0 && !server->EnablePhase0(*g_orchestrator_service)) {
+        return false;
+    }
     recovery_service = std::make_unique<RecoveryServiceImpl>(server.get());
     
     std::vector<grpc::Service*> additional_services = {recovery_service.get()};
@@ -47,16 +55,13 @@ bool InitFaultClient(const std::string& addr, int port)
     return client.Initialize(piccolo_addr);
 }
 
-std::unique_ptr<grpc::Server> g_orchestrator_server;
-std::unique_ptr<timpani::orchestrator::OrchestratorServiceImpl>
-    g_orchestrator_service;
-
 bool RunOrchestratorServer(int port)
 {
     std::string server_address("0.0.0.0:" + std::to_string(port));
-    g_orchestrator_service =
-        std::make_unique<timpani::orchestrator::OrchestratorServiceImpl>();
-
+    if (!g_orchestrator_service) {
+        g_orchestrator_service =
+            std::make_unique<timpani::orchestrator::OrchestratorServiceImpl>();
+    }
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(g_orchestrator_service.get());
@@ -72,7 +77,7 @@ bool RunOrchestratorServer(int port)
 
 bool GetOptions(int argc, char* argv[], int& sinfo_port,
                 std::string& fault_addr, int& fault_port,
-                std::string& node_config_file)
+                std::string& node_config_file, bool& phase0)
 {
     const char* short_opts = "hs:f:p:c:";
     const struct option long_opts[] = {
@@ -81,6 +86,7 @@ bool GetOptions(int argc, char* argv[], int& sinfo_port,
         {"faulthost", required_argument, nullptr, 'f'},
         {"faultport", required_argument, nullptr, 'p'},
         {"node-config", required_argument, nullptr, 'c'},
+        {"runtime-table-update-phase0", no_argument, nullptr, 1000},
         {nullptr, 0, nullptr, 0}};
     int opt;
 
@@ -99,6 +105,9 @@ bool GetOptions(int argc, char* argv[], int& sinfo_port,
             case 'c':
                 node_config_file = optarg;
                 break;
+            case 1000:
+                phase0 = true;
+                break;
             case 'h':
             default:
                 std::cerr
@@ -111,6 +120,8 @@ bool GetOptions(int argc, char* argv[], int& sinfo_port,
                     << "  -p <port>\t\tPort for FaultService (default: 50053)\n"
                     << "  -c, --node-config <file>\tNode configuration YAML "
                        "file\n"
+                    << "  --runtime-table-update-phase0\tOpt-in single-node TT "
+                       "candidate/ACK updates\n"
                     << "  -h\t\t\tShow this help message\n";
                 std::cerr
                     << "Example: " << argv[0]
@@ -129,9 +140,10 @@ int main(int argc, char** argv)
     std::string fault_addr = "localhost";
     int fault_port = 50053;
     std::string node_config_file;  // Node configuration file path
+    bool phase0 = false;
 
     if (!GetOptions(argc, argv, sinfo_port, fault_addr, fault_port,
-                    node_config_file)) {
+                    node_config_file, phase0)) {
         exit(EXIT_FAILURE);
     }
 
@@ -158,7 +170,11 @@ int main(int argc, char** argv)
     // config)
     std::unique_ptr<SchedInfoServer> sinfo_server;
     std::unique_ptr<RecoveryServiceImpl> recovery_service;
-    if (!RunSchedInfoServer(sinfo_port, sinfo_server, node_config_manager, recovery_service)) {
+    if (phase0) {
+        g_orchestrator_service =
+            std::make_unique<timpani::orchestrator::OrchestratorServiceImpl>();
+    }
+    if (!RunSchedInfoServer(sinfo_port, sinfo_server, node_config_manager, recovery_service, phase0)) {
         return EXIT_FAILURE;
     }
 
@@ -192,6 +208,11 @@ int main(int argc, char** argv)
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        if (phase0) {
+            sinfo_server->PushPendingTables();
+            continue;
+        }
 
         // Check if SchedInfo has been updated and queue replay as needed.
         bool changed = false;

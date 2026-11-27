@@ -35,6 +35,10 @@ Status SchedInfoServiceImpl::AddSchedInfo(ServerContext* context,
                                           const SchedInfo* request,
                                           Response* reply)
 {
+    if (phase0_) {
+        reply->set_status(SubmitPhase0Update(Phase0Operation::Add, {*request}) ? 0 : -1);
+        return Status::OK;
+    }
     TLOG_INFO("Received SchedInfo: ", request->workload_id(), " with ",
               request->tasks_size(), " tasks");
 
@@ -212,6 +216,15 @@ std::vector<ClassifiedTask> SchedInfoServiceImpl::ConvertToClassifiedTasks(
 
 ScheduleTableMap SchedInfoServiceImpl::GetScheduleTables(bool* changed)
 {
+    if (phase0_) {
+        std::lock_guard<std::mutex> lock(phase0_->mutex);
+        if (changed) {
+            *changed = phase0_->changed;
+            phase0_->changed = false;
+        }
+        if (!phase0_->confirmed) return {};
+        return {{phase0_->node_id, phase0_->confirmed->table}};
+    }
     std::shared_lock<std::shared_mutex> lock(schedule_mutex_);
     if (changed) {
         *changed = schedule_changed_;
@@ -331,6 +344,9 @@ void SchedInfoServer::DumpSchedInfo()
 
 bool SchedInfoServiceImpl::RemoveWorkload(const std::string& workload_id, std::string* resolved_id, bool trigger_push)
 {
+    if (phase0_) {
+        return RemovePhase0Workload(workload_id, resolved_id, trigger_push);
+    }
     std::unique_lock<std::shared_mutex> lock(schedule_mutex_);
     auto existing_it = workload_tasks_.find(workload_id);
     if (existing_it == workload_tasks_.end()) {
@@ -368,4 +384,3 @@ bool SchedInfoServiceImpl::RemoveWorkload(const std::string& workload_id, std::s
         return false;
     }
 }
-

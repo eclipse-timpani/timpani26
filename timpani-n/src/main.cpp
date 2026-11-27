@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +30,8 @@
 #include "gpdata_writer.h"
 #endif
 #include "grpc/node_client.h"
+#include "phase0_attempt.h"
+#include "phase0_prepare.h"
 #ifdef CONFIG_TRACE_BPF_EVENT
 #include "schedstat_monitor.h"
 #endif
@@ -85,9 +88,12 @@ struct RuntimeOptions {
     int orchestrator_port = 50060;
     std::string node_id_override;
     bool enable_plot = false;
+    bool runtime_table_update_phase0 = false;
     bool show_help = false;
     bool show_version = false;
 };
+
+constexpr int kOptRuntimeTableUpdatePhase0 = 0x100;
 
 void print_usage(const char* prog)
 {
@@ -101,6 +107,8 @@ void print_usage(const char* prog)
                  "elsewhere\n"
               << "  -g          Enable gpdata output (<node>.gpdata)\n"
               << "  -s          (compat) accepted\n"
+              << "  --runtime-table-update-phase0\n"
+              << "              Enable the DDR-011 Phase 0 table update path\n"
               << "  -V          Show version information\n"
               << "  -h          Show this help\n";
 }
@@ -120,9 +128,16 @@ bool parse_port(const char* text, int& port_out)
 
 bool parse_runtime_options(int argc, char** argv, RuntimeOptions& options)
 {
+    static const struct option kLongOptions[] = {
+        {"runtime-table-update-phase0", no_argument, nullptr,
+         kOptRuntimeTableUpdatePhase0},
+        {nullptr, 0, nullptr, 0},
+    };
+
     opterr = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "hVn:p:l:P:gs")) != -1) {
+    while ((opt = getopt_long(argc, argv, "hVn:p:l:P:gs", kLongOptions,
+                              nullptr)) != -1) {
         switch (opt) {
             case 'h':
                 options.show_help = true;
@@ -150,10 +165,18 @@ bool parse_runtime_options(int argc, char** argv, RuntimeOptions& options)
             case 's':
                 // Compatibility flag: accepted for legacy launch scripts.
                 break;
+            case kOptRuntimeTableUpdatePhase0:
+                options.runtime_table_update_phase0 = true;
+                break;
             case '?':
             default:
-                std::cerr << "Unknown option: -" << static_cast<char>(optopt)
-                          << std::endl;
+                if (optopt > 0 && optopt < kOptRuntimeTableUpdatePhase0) {
+                    std::cerr << "Unknown option: -"
+                              << static_cast<char>(optopt) << std::endl;
+                } else {
+                    std::cerr << "Unknown option: " << argv[optind - 1]
+                              << std::endl;
+                }
                 return false;
         }
     }
@@ -342,6 +365,10 @@ int main(int argc, char** argv)
         std::cout << "[main] Node ID override: "
                   << runtime_options.node_id_override << std::endl;
     }
+    if (runtime_options.runtime_table_update_phase0) {
+        std::cout << "[main] DDR-011 Phase 0 table update path enabled"
+                  << std::endl;
+    }
     if (runtime_options.enable_plot) {
 #ifdef CONFIG_TRACE_BPF_EVENT
         std::cout << "[main] gpdata output enabled (-g)" << std::endl;
@@ -421,9 +448,26 @@ int main(int argc, char** argv)
         }
 #endif
 
+        // DDR-011 Phase 0 state is owned by the main loop and must outlive
+        // the gRPC reader thread.
+        const bool phase0_enabled = runtime_options.runtime_table_update_phase0;
+        timpani::node::phase0::AttemptSlot phase0_attempt;
+        timpani::node::phase0::ActiveBaseline phase0_active;
+        std::string phase0_node_id;
+        uint64_t phase0_isolated_mask = 0;
+        if (phase0_enabled) {
+            // Validate against the exact node_id reported to Timpani-O.
+            phase0_node_id = resolve_node_id(runtime_options);
+            phase0_isolated_mask =
+                timpani::node::phase0::detect_isolated_cpu_mask();
+            std::cout << "[main] Phase 0 isolated CPU mask: 0x" << std::hex
+                      << phase0_isolated_mask << std::dec << std::endl;
+        }
+
         // Initialize NodeClient (gRPC)
-        timpani::node::NodeClient node_client(orchestrator_endpoint,
-                                              runtime_options.node_id_override);
+        timpani::node::NodeClient node_client(
+            orchestrator_endpoint,
+            phase0_enabled ? phase0_node_id : runtime_options.node_id_override);
 
         // 5. Initialize Timer Master (Time-Triggered / CBS Execution Thread)
         timpani::node::TimerMaster timer_master(bpf_loader);
@@ -435,6 +479,9 @@ int main(int argc, char** argv)
         std::map<std::string, std::vector<uint64_t>> workload_to_cbs_keys;
         std::map<uint64_t, std::string> workload_hash_to_id;
         std::mutex workload_map_mutex;
+        // Serializes full-table apply with recovery eviction. Lock order:
+        // table_apply_mutex, then workload_map_mutex.
+        std::mutex table_apply_mutex;
 
         // Connect callbacks
         node_client.set_shutdown_callback([](uint32_t grace_period_ms) {
@@ -464,10 +511,12 @@ int main(int argc, char** argv)
         //   eviction requires a round-trip through Pullpiri.
         // ===================================================================
         node_client.set_recovery_callback([&timer_master, &bpf_loader, &workload_to_pids, &workload_to_slots, &workload_to_hash, &workload_to_cbs_keys, &workload_hash_to_id, &workload_map_mutex,
+                                           &table_apply_mutex,
                                            &fault_monitor](const auto& recovery_signal) {
             std::cout << "[main] Received recovery signal for workload: " << recovery_signal.workload_id()
                       << " action: " << recovery_signal.action() << std::endl;
             if (recovery_signal.action() == timpani::node::v1::RecoverySignal::ACTION_STOP) {
+                std::lock_guard<std::mutex> apply_lock(table_apply_mutex);
                 std::lock_guard<std::mutex> lock(workload_map_mutex);
                 std::string wid = recovery_signal.workload_id();
                 if (workload_to_pids.find(wid) == workload_to_pids.end()) {
@@ -558,18 +607,21 @@ int main(int argc, char** argv)
         fault_monitor.start();
 
         // Wire table_callback: received HierarchicalScheduleTable → TimerMaster
-        // slots (Re-set callback now that timer_master is in scope)
-        node_client.set_table_callback([&timer_master, &bpf_loader,
-                                        &node_client,
-                                        &runtime_options,
-                                        &workload_to_pids, &workload_to_slots, &workload_to_hash, &workload_to_cbs_keys, &workload_hash_to_id, &workload_map_mutex,
-                                        &fault_monitor
+        // slots (Re-set callback now that timer_master is in scope).
+        // apply_full_table() is the legacy full-table apply; the caller sends
+        // TableApplied with the returned {success, error}.
+        auto apply_full_table =
+            [&timer_master, &bpf_loader, &runtime_options, &workload_to_pids,
+             &workload_to_slots, &workload_to_hash, &workload_to_cbs_keys,
+             &workload_hash_to_id, &workload_map_mutex, &table_apply_mutex,
+             &fault_monitor
 #ifdef CONFIG_TRACE_BPF_EVENT
-                                        ,
-                                        &schedstat_monitor, &gpdata_pid_to_task,
-                                        &gpdata_pid_map_mutex
+             ,
+             &schedstat_monitor, &gpdata_pid_to_task, &gpdata_pid_map_mutex
 #endif
-        ](const auto& table) {
+        ](const timpani::node::v1::HierarchicalScheduleTable& table)
+            -> std::pair<bool, std::string> {
+            std::lock_guard<std::mutex> apply_lock(table_apply_mutex);
             std::cout << "[main] Received table: " << table.table_id()
                       << " hyperperiod=" << table.hyperperiod_us() << "us"
                       << " partitions=" << table.partitions_size() << std::endl;
@@ -921,16 +973,203 @@ int main(int argc, char** argv)
             std::cout << "[main] TimerMaster table updated: " << slots.size()
                       << " slots, hyperperiod=" << hyperperiod_us << "us"
                       << std::endl;
-            node_client.send_table_applied(table.table_id(), apply_success,
-                                           apply_error);
-        });
+            return {apply_success, apply_error};
+        };
 
+        // DDR-011 Phase 0 (L-P0-06) side effects of one attempt, used only by
+        // the main non-RT loop. Removed tasks keep their affinity and policy.
+        class Phase0Port final : public timpani::node::phase0::AttemptPort
+        {
+          public:
+            Phase0Port(timpani::node::TimerMaster& timer,
+                       timpani::node::BpfLoader& bpf,
+                       timpani::node::FaultMonitor& faults,
+                       std::mutex& map_mutex,
+                       std::map<std::string, std::vector<pid_t>>& pids,
+                       std::map<std::string, std::vector<TtSlotKey>>& slots,
+                       std::map<std::string, uint64_t>& hashes,
+                       std::map<std::string, std::vector<uint64_t>>& cbs_keys,
+                       std::map<uint64_t, std::string>& ids)
+                : timer_(timer),
+                  bpf_(bpf),
+                  faults_(faults),
+                  map_mutex_(map_mutex),
+                  pids_(pids),
+                  slots_(slots),
+                  hashes_(hashes),
+                  cbs_keys_(cbs_keys),
+                  ids_(ids)
+            {
+            }
+
+            uint64_t now_ns() override
+            {
+                return timpani::node::phase0::realtime_now_ns();
+            }
+            void sleep_until(uint64_t ns) override
+            {
+                struct timespec ts;
+                ts.tv_sec = static_cast<time_t>(ns / 1000000000ULL);
+                ts.tv_nsec = static_cast<long>(ns % 1000000000ULL);
+                while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts,
+                                       nullptr) == EINTR) {
+                }
+            }
+            int active_bank() override
+            {
+                ::KernelControl* control = bpf_.kernel_control();
+                if (!control) return -1;
+                return static_cast<int>(
+                    __atomic_load_n(&control->active_bank_idx,
+                                    __ATOMIC_SEQ_CST) &
+                    1u);
+            }
+            bool apply(const timpani::node::phase0::NPrepared& prepared,
+                       timpani::node::phase0::ApplyResult& result) override
+            {
+                return timer_.apply_phase0_table(prepared, result);
+            }
+            bool shm_state(uint32_t& generation, bool& magic_valid) override
+            {
+                return timpani::node::phase0::read_shm_state(generation,
+                                                             magic_valid);
+            }
+            bool clear_inactive_bank() override
+            {
+                // Staging an empty table clears the inactive (old) bank.
+                return bpf_.stage_table(timpani::node::phase0::NPrepared());
+            }
+            void update_tracking(
+                const timpani::node::phase0::NPrepared& prepared) override
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                pids_.clear();
+                slots_.clear();
+                hashes_.clear();
+                cbs_keys_.clear();
+                ids_.clear();
+                for (const auto& item : prepared.tasks) {
+                    const auto& task = item.second;
+                    pids_[task.workload_id].push_back(task.pid);
+                    hashes_[task.workload_id] = task.workload_id_hash;
+                    ids_[task.workload_id_hash] = task.workload_id;
+                }
+                for (const auto& slot : prepared.slots) {
+                    const auto id =
+                        prepared.workloads.find(slot.workload_id_hash);
+                    if (id != prepared.workloads.end()) {
+                        slots_[id->second].push_back(
+                            TtSlotKey{slot.cpu, slot.slot_idx});
+                    }
+                }
+            }
+            void reset_faults(
+                const timpani::node::phase0::FaultLimits& limits) override
+            {
+                faults_.clear_state();
+                faults_.update_current_limits(limits);
+            }
+
+          private:
+            timpani::node::TimerMaster& timer_;
+            timpani::node::BpfLoader& bpf_;
+            timpani::node::FaultMonitor& faults_;
+            std::mutex& map_mutex_;
+            std::map<std::string, std::vector<pid_t>>& pids_;
+            std::map<std::string, std::vector<TtSlotKey>>& slots_;
+            std::map<std::string, uint64_t>& hashes_;
+            std::map<std::string, std::vector<uint64_t>>& cbs_keys_;
+            std::map<uint64_t, std::string>& ids_;
+        };
+        Phase0Port phase0_port(timer_master, bpf_loader, fault_monitor,
+                               workload_map_mutex, workload_to_pids,
+                               workload_to_slots, workload_to_hash,
+                               workload_to_cbs_keys, workload_hash_to_id);
+
+        // Phase 0 attempt on the main non-RT loop: pre-check, boundary
+        // handover, completion checks and cleanup before the ACK decision.
+        auto run_phase0_attempt =
+            [&phase0_active, &phase0_node_id, &phase0_isolated_mask,
+             &phase0_port](
+                const timpani::node::v1::HierarchicalScheduleTable& table)
+            -> timpani::node::phase0::AttemptResult {
+            namespace phase0 = timpani::node::phase0;
+            phase0::NodeEnvironment env;
+            env.node_id = phase0_node_id;
+            env.isolated_cpu_mask = phase0_isolated_mask;
+            env.now_ns = phase0::realtime_now_ns();
+            env.resolve_pids = phase0::scan_proc_pids;
+            if (!phase0::read_shm_generation(env.shm_generation)) {
+                return phase0::rejected_attempt(phase0_node_id,
+                                                table.table_id(),
+                                                "SHM generation unavailable");
+            }
+            return phase0::run_attempt(table, env, phase0_active, phase0_port);
+        };
+
+        if (!phase0_enabled) {
+            node_client.set_table_callback(
+                [&node_client, &apply_full_table](const auto& table) {
+                    const auto result = apply_full_table(table);
+                    node_client.send_table_applied(table.table_id(),
+                                                   result.first, result.second);
+                });
+        } else {
+            node_client.set_table_callback([&node_client, &phase0_attempt](
+                                               const auto& table) {
+                if (!phase0_attempt.offer(table)) {
+                    node_client.send_table_applied(table.table_id(), false,
+                                                   "busy: update in progress");
+                }
+            });
+            node_client.set_update_callback([&node_client](const auto& update) {
+                node_client.send_table_applied(
+                    update.table_id(), false,
+                    "delta update is outside Phase 0");
+            });
+        }
+
+        if (phase0_enabled && !timer_master.enable_phase0()) {
+            std::cerr << "[main] Failed to enable the Phase 0 timer mode"
+                      << std::endl;
+            return 1;
+        }
         timer_master.start();
         node_client.connect();
 
-        // Daemon simply waits for shutdown signal
-        while (!g_shutdown) {
-            sleep(1);
+        if (!phase0_enabled) {
+            // Daemon simply waits for shutdown signal
+            while (!g_shutdown) {
+                sleep(1);
+            }
+        } else {
+            namespace phase0 = timpani::node::phase0;
+            timpani::node::v1::HierarchicalScheduleTable phase0_table;
+            while (!g_shutdown) {
+                if (!phase0_attempt.wait_take(phase0_table,
+                                              std::chrono::milliseconds(500))) {
+                    continue;
+                }
+                const phase0::AttemptResult result =
+                    run_phase0_attempt(phase0_table);
+                const bool applied =
+                    result.outcome == phase0::AttemptOutcome::kApplied;
+                (applied ? std::cout : std::cerr) << result.log << std::endl;
+                if (result.outcome == phase0::AttemptOutcome::kTrialFailed) {
+                    // Neither ACK nor restore after the handover started.
+                    // The attempt stays busy and Timpani-O stops the trial on
+                    // the disconnect (L-P0-06).
+                    node_client.disconnect();
+                    break;
+                }
+                // Clear busy before ACK so the next request is not rejected.
+                phase0_attempt.finish();
+                node_client.send_table_applied(phase0_table.table_id(),
+                                               applied, result.reason);
+            }
+            while (!g_shutdown) {
+                sleep(1);
+            }
         }
 
         std::cout << "\nShutting down..." << std::endl;

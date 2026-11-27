@@ -202,35 +202,73 @@ bool GlobalScheduler::assign_cpus(
         tt_workload_groups[tt_tasks[i].workload_id].push_back(i);
     }
 
-    size_t cpu_idx = 0;
-    std::map<std::string, int> tt_workload_cpu;  // workload_id → assigned CPU
+    std::map<std::string, int> tt_workload_cpu;
+    std::set<int> used_tt_cpus;
 
-    for (const auto& [wl_id, task_indices] : tt_workload_groups) {
-        if (cpu_idx >= available_cpus.size()) {
-            // Ran out of CPUs — share with the last one
-            cpu_idx = available_cpus.size() - 1;
-            TLOG_WARN("Not enough isolated CPUs for dedicated TT assignment; "
-                      "sharing CPU ", available_cpus[cpu_idx],
-                      " for workload '", wl_id, "'");
-        }
-
-        int cpu = available_cpus[cpu_idx];
-        tt_workload_cpu[wl_id] = cpu;
-
-        double wl_util = 0.0;
+    auto utilization = [&tt_tasks](const std::vector<size_t>& task_indices) {
+        double result = 0.0;
         for (size_t idx : task_indices) {
-            tt_tasks[idx].assigned_cpu = cpu;
             if (tt_tasks[idx].period_us > 0) {
-                wl_util += static_cast<double>(tt_tasks[idx].wcet_us) /
-                           tt_tasks[idx].period_us;
+                result += static_cast<double>(tt_tasks[idx].wcet_us) /
+                          tt_tasks[idx].period_us;
             }
         }
-        cpu_schedules[cpu].u_tt += wl_util;
-
+        return result;
+    };
+    auto place_workload = [&](const std::string& wl_id,
+                              const std::vector<size_t>& task_indices,
+                              int cpu) {
+        for (size_t idx : task_indices) tt_tasks[idx].assigned_cpu = cpu;
+        cpu_schedules[cpu].u_tt += utilization(task_indices);
+        used_tt_cpus.insert(cpu);
+        tt_workload_cpu[wl_id] = cpu;
         TLOG_INFO("  TT workload '", wl_id, "' → CPU ", cpu,
                   " (", task_indices.size(), " tasks, U_tt=",
                   cpu_schedules[cpu].u_tt, ")");
-        ++cpu_idx;
+    };
+
+    // Preserve explicit Phase 0 assignments before placing new workloads.
+    for (const auto& [wl_id, task_indices] : tt_workload_groups) {
+        int pinned_cpu = -1;
+        for (size_t idx : task_indices) {
+            const int task_cpu = tt_tasks[idx].assigned_cpu;
+            if (task_cpu < 0) continue;
+            if (std::find(available_cpus.begin(), available_cpus.end(),
+                          task_cpu) == available_cpus.end()) {
+                TLOG_ERROR("Pinned TT workload '", wl_id,
+                           "' uses unavailable CPU ", task_cpu);
+                return false;
+            }
+            if (pinned_cpu >= 0 && pinned_cpu != task_cpu) {
+                TLOG_ERROR("Pinned TT workload '", wl_id,
+                           "' spans multiple CPUs");
+                return false;
+            }
+            pinned_cpu = task_cpu;
+        }
+        if (pinned_cpu >= 0) place_workload(wl_id, task_indices, pinned_cpu);
+    }
+
+    for (const auto& [wl_id, task_indices] : tt_workload_groups) {
+        if (tt_workload_cpu.count(wl_id) != 0) continue;
+
+        int cpu = -1;
+        for (int candidate : available_cpus) {
+            if (used_tt_cpus.count(candidate) == 0) {
+                cpu = candidate;
+                break;
+            }
+        }
+        if (cpu < 0) {
+            cpu = available_cpus.front();
+            for (int candidate : available_cpus) {
+                if (cpu_schedules[candidate].u_tt < cpu_schedules[cpu].u_tt)
+                    cpu = candidate;
+            }
+            TLOG_WARN("Not enough isolated CPUs for dedicated TT assignment; "
+                      "sharing CPU ", cpu, " for workload '", wl_id, "'");
+        }
+        place_workload(wl_id, task_indices, cpu);
     }
 
     // ② L2 CBS tasks: worst-fit decreasing by residual capacity (DDR-007 §3.3)

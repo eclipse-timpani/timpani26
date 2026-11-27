@@ -25,6 +25,9 @@ include_directories(${GTEST_INCLUDE_DIRS})
 add_executable(test_schedinfo_service
     test_schedinfo_service.cpp
     ../src/schedinfo_service.cpp
+    ../src/phase0_runtime.cpp
+    ../src/orchestrator_service.cpp
+    ../src/fault_client.cpp
     ../src/node_config.cpp
     ../src/global_scheduler.cpp
 )
@@ -47,6 +50,51 @@ add_test(NAME SchedInfoServiceTest COMMAND test_schedinfo_service)
 set_tests_properties(SchedInfoServiceTest PROPERTIES
     TIMEOUT 30
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+add_executable(test_runtime_table_update
+    test_runtime_table_update.cpp
+    ../src/schedinfo_service.cpp
+    ../src/phase0_runtime.cpp
+    ../src/orchestrator_service.cpp
+    ../src/fault_client.cpp
+    ../src/node_config.cpp
+    ../src/global_scheduler.cpp
+)
+target_compile_definitions(test_runtime_table_update PRIVATE
+    PHASE0_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/phase0_node.yaml"
+    PHASE0_TWO_CPU_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/phase0_node_two_cpu.yaml"
+    MULTI_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/node_configurations.yaml"
+)
+target_link_libraries(test_runtime_table_update
+    GTest::gtest GTest::gtest_main gRPC::grpc++ protobuf::libprotobuf
+    schedinfo_proto node_control_proto pthread
+)
+add_test(NAME RuntimeTableUpdateTest COMMAND test_runtime_table_update)
+set_tests_properties(RuntimeTableUpdateTest PROPERTIES TIMEOUT 30)
+
+# DDR-011 Phase 0 target E2E driver (P0-T06). It needs a real Timpani-N on the
+# target, so it reports SKIPPED unless TIMPANI_P0_E2E=1.
+add_executable(test_phase0_e2e
+    test_phase0_e2e.cpp
+    ../src/schedinfo_service.cpp
+    ../src/phase0_runtime.cpp
+    ../src/orchestrator_service.cpp
+    ../src/fault_client.cpp
+    ../src/node_config.cpp
+    ../src/global_scheduler.cpp
+)
+target_compile_definitions(test_phase0_e2e PRIVATE
+    PHASE0_NODE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../examples/phase0_node.yaml"
+)
+target_link_libraries(test_phase0_e2e
+    GTest::gtest GTest::gtest_main gRPC::grpc++ protobuf::libprotobuf
+    schedinfo_proto node_control_proto pthread
+)
+add_test(NAME Phase0E2ETest COMMAND test_phase0_e2e)
+set_tests_properties(Phase0E2ETest PROPERTIES
+    TIMEOUT 600
+    SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]"
 )
 
 # Create FaultServiceClient test executable
@@ -156,6 +204,7 @@ add_executable(test_recovery_service
     test_recovery_service.cpp
     ../src/recovery_service.cpp
     ../src/schedinfo_service.cpp
+    ../src/phase0_runtime.cpp
     ../src/node_config.cpp
     ../src/global_scheduler.cpp
     ../src/orchestrator_service.cpp

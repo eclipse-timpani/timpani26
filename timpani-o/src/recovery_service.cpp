@@ -21,6 +21,17 @@ Status RecoveryServiceImpl::EnforceRecoveryPolicy(ServerContext* context,
     TLOG_INFO("Received RecoveryCommand: workload '", request->workload_id(),
               "' policy: ", schedinfo::v1::RecoveryPolicy_Name(request->recovery_policy()));
 
+    if (request->recovery_policy() == schedinfo::v1::RecoveryPolicy::RECOVERY_STOP &&
+        schedinfo_server_ && schedinfo_server_->Phase0Enabled()) {
+        // DDR-011 v2.4: STOP is a replacement full_table without the workload (no
+        // RecoverySignal); the reply carries the correlated TableApplied result.
+        TLOG_INFO("RecoveryPolicy is STOP for workload '", request->workload_id(),
+                  "'. Removing it with a replacement table.");
+        const bool removed = schedinfo_server_->RemoveWorkload(request->workload_id(), nullptr, false);
+        reply->set_status(removed ? 0 : -1);
+        return Status::OK;
+    }
+
     if (request->recovery_policy() == schedinfo::v1::RecoveryPolicy::RECOVERY_STOP) {
         TLOG_INFO("RecoveryPolicy is STOP for workload '", request->workload_id(), "'. Removing workload and Broadcasting RecoverySignal.");
 

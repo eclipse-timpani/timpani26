@@ -142,6 +142,7 @@ cmake -DGIT_COMMIT_HASH=$GIT_HASH .. && make
 | `CONFIG_TRACE_BPF` | ON | Enable eBPF sched_ext scheduler |
 | `CONFIG_TRACE_EVENT` | ON | Enable ftrace for sched/timer events |
 | `CONFIG_TRACE_BPF_EVENT` | OFF | Track sched_switch/waking events |
+| `BUILD_TESTS` | OFF | Build host unit tests (no BPF or target needed) |
 | `TIMPANI_KERNEL_BTF_FILE` | `/sys/kernel/btf/vmlinux` | Target kernel BTF ELF used for API detection and `vmlinux.h` generation |
 | `TIMPANI_SCX_API` | `AUTO` | Select `AUTO`, `LEGACY`, or `DSQ` sched_ext kfunc family |
 
@@ -156,6 +157,34 @@ helper sets and the build should prefer one of them.
 # Disable BPF (fallback to timer-only mode)
 cmake -DCONFIG_TRACE_BPF=OFF ..
 ```
+
+### Unit Tests
+
+The DDR-011 Phase 0 host tests build without BPF, so they can run on a
+development host:
+
+| Test | Covers |
+|------|--------|
+| `test_phase0_prepare` | Table pre-checks and `NPrepared` assembly (P0-T02) |
+| `test_bpf_loader` | TT bank routing, handover, and staging helpers (P0-T03) |
+| `test_libttsched` | `/timpani_ttsched` even/odd generation publication and libttsched wake rules (P0-T05) |
+| `test_phase0_handover` | Boundary handover between the coordinator and the resident RT engine, and the SHM image written during the TT-free window (P0-T04) |
+| `test_phase0_attempt` | One Phase 0 attempt on the main loop: the checks and old-bank cleanup before a successful `TableApplied`, rejections without side effects, and trial failures (P0-T06) |
+
+```bash
+cmake -S . -B build-tests -DCONFIG_TRACE_BPF=OFF -DBUILD_TESTS=ON
+cmake --build build-tests --target test_phase0_prepare test_bpf_loader \
+    test_libttsched test_phase0_handover test_phase0_attempt
+cd build-tests && ctest --output-on-failure
+```
+
+These tests do not cover BPF, `/proc`, or cgroup behavior on the target.
+`test_libttsched` uses in-process memory and a scripted wait instead of the
+real SHM object and futex. `test_phase0_handover` simulates time and the
+kernel operations; it does not exercise the real gate, BPF references, or RT
+latency. `test_phase0_attempt` replaces TimerMaster, BPF, SHM and FaultMonitor
+with a fake. Memory ordering must still be verified on the target.
+`test_bpf_loader` needs `<linux/types.h>` (a Linux host or a header shim).
 
 ### Cross-compilation (ARM64)
 
@@ -296,9 +325,51 @@ Usage: timpani-n [options] [orchestrator_host]
 Options:
   -n <name>   Node ID override (default: hostname)
   -p <port>   Orchestrator gRPC port (default: 50060)
+  --runtime-table-update-phase0
+              Enable the DDR-011 Phase 0 table update path
   -V          Print version, Git commit, and build timestamp
   -h          Show help
 ```
+
+`--runtime-table-update-phase0` is opt-in and should be paired with the same
+flag on timpani-o. Without it, the existing table path is unchanged. With it,
+timpani-n:
+
+- checks each full table on the main non-RT loop before touching active state
+  (node ID, fixed epoch and hyperperiod, one isolated CPU, TT only, slot range,
+  ID/hash consistency, a single live PID per task, at most 32 tasks and 2048
+  slots) and rejects a failing table with `TableApplied(success=false)`;
+- preserves each retained workload's complete slot multiset (task identity,
+  offset, duration, deadline, CPU, current limit, layer and repetition count).
+  Changes are rejected before PID resolution or staging. Snapshot order
+  and slot ordinals may change; adding/removing whole workloads and CLEAR
+  remain supported;
+- rejects a full table that arrives while another is in progress (`busy`) and
+  every delta `update` command;
+- leaves the OS CPU affinity of removed tasks unchanged.
+
+An accepted table is staged in the inactive BPF bank. The resident RT thread
+of TimerMaster switches to it at a future boundary `T = E + kH`, after the old
+slots end, and publishes the prepared SHM image there. timpani-n sends
+`TableApplied(success=true)` only after all of the following:
+
+- the active bank changed, the published even SHM generation is visible, and
+  the actual apply time is not before `T`;
+- the old bank was cleared once BPF stopped referencing it (retried every 1 ms
+  for up to 100 ms);
+- workload tracking was rebuilt and FaultMonitor was reset with the new
+  limits.
+
+A rejection before any active change returns `success=false` with the reason.
+A failure after the handover started is not acknowledged and the previous
+table is not restored. timpani-n logs `result=trial_failed` and disconnects,
+and timpani-o stops the trial. Restart timpani-n before the next trial. Each
+attempt logs one `[RTU-P0]` line with `node_id`, `table_id`,
+`added_workloads`, `removed_workloads`, `planned_boundary_ns`,
+`actual_apply_ns`, `active_bank`, `shm_gen` and `result`/`reason`. The `-g`
+gpdata output does not follow Phase 0 table changes. Linux target validation
+is still required; see the
+[Phase 0 plan](../doc/design/DDR-011-runtime-table-update-phase0/implementation_plan.md).
 
 **Example:**
 ```bash

@@ -38,7 +38,7 @@ struct timpani_ttsched_shm {
     uint32_t
         magic; /* TIMPANI_TTSCHED_MAGIC when schedule is ready, 0 otherwise */
     uint32_t n_tasks; /* number of active task slots (atomic RELEASE write) */
-    uint32_t generation; /* monotonically incremented on schedule update */
+    uint32_t generation; /* even when stable, odd while being published */
     uint32_t _pad;
     struct timpani_task_slot tasks[TIMPANI_MAX_TASKS];
     struct timpani_tt_release releases[TIMPANI_MAX_TASKS];
@@ -62,12 +62,15 @@ void ttsched_init(void);
  * ttsched_wait_next_period() - Block until TimerMaster fires this task's slot.
  *
  * Returns:
- *   0  — woken by TimerMaster (slot fired); caller should execute workload.
- *  -1  — SHM not ready, slot not found, or shutdown detected (magic = 0);
+ *   0  — this task's own slot fired: its counter advanced in a stable
+ *        (even-generation) publication; caller should execute workload.
+ *  -1  — SHM not ready or being published, slot not found (not yet
+ *         published, removed or cleared), or shutdown detected (magic = 0);
  *         caller must skip the workload and retry on the next call.
  *
- * Falls back to usleep(1000) and returns -1 if the schedule is not yet
- * published or timpani-n is not running.
+ * Publication, control and signal wakes without a counter advance are not
+ * reported as jobs. Falls back to usleep(1000) and returns -1 if the schedule
+ * is not yet published or timpani-n is not running.
  */
 int ttsched_wait_next_period(void);
 

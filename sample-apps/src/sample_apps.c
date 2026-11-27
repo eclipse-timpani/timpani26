@@ -600,6 +600,9 @@ static void print_usage(const char* prog_name)
     printf(
         "  -b, --bpf               Use BPF/TT-Sched futex-based wakeup "
         "(timpani26 mode)\n");
+    printf(
+        "  -c, --cpu-time          Measure runtime with CPU time instead of "
+        "wall clock\n");
     printf("  -h, --help              Show this help message\n");
     printf("\nWorkload Examples:\n");
     printf("  Light CPU workload:\n");
@@ -625,7 +628,7 @@ int main(int argc, char* argv[])
      * buffers or we hang on futex */
     setvbuf(stdout, NULL, _IONBF, 0);
     sigset_t sig_set;
-    struct timespec now, before, deadline_time;
+    struct timespec now, before, wall_now, wall_before, deadline_time;
     clockid_t clockid = CLOCK_MONOTONIC;
     int signo = SIGNO_TT;
     int signal_received = -1;
@@ -633,6 +636,7 @@ int main(int argc, char* argv[])
     int loop_cnt = 10;
     bool use_timer = false;
     bool use_bpf = false;
+    bool use_cpu_time = false;
 
     /* Initialize task configuration and stats */
     rt_task_init(&task_config);
@@ -649,13 +653,14 @@ int main(int argc, char* argv[])
         {"stats", no_argument, 0, 's'},
         {"timer", no_argument, 0, 't'},
         {"bpf", no_argument, 0, 'b'},
+        {"cpu-time", no_argument, 0, 'c'},
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'V'},
         {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:d:r:P:a:l:stbhV", long_options,
-                              NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:r:P:a:l:stbchV",
+                              long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 task_config.period_ms = strtoul(optarg, NULL, 10);
@@ -691,6 +696,9 @@ int main(int argc, char* argv[])
                 break;
             case 'b':
                 use_bpf = true;
+                break;
+            case 'c':
+                use_cpu_time = true;
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -785,6 +793,13 @@ int main(int argc, char* argv[])
         printf("Waiting for signal %d to start periodic execution...\n", signo);
     }
 
+    if (use_cpu_time) {
+        clockid = CLOCK_THREAD_CPUTIME_ID;
+        printf("Runtime measured with: CPU time (CLOCK_THREAD_CPUTIME_ID)\n");
+    } else {
+        printf("Runtime measured with: wall clock (CLOCK_MONOTONIC)\n");
+    }
+
     while (!shutdown_requested) {
         if (use_bpf) {
             if (ttsched_wait_next_period() != 0)
@@ -802,11 +817,16 @@ int main(int argc, char* argv[])
             }
         }
 
-        /* Record start time */
-        clock_gettime(clockid, &before);
+        /* Record start time. Deadlines always use wall-clock time. */
+        clock_gettime(CLOCK_MONOTONIC, &wall_before);
+        if (clockid == CLOCK_MONOTONIC) {
+            before = wall_before;
+        } else {
+            clock_gettime(clockid, &before);
+        }
 
         /* Calculate deadline time */
-        deadline_time = before;
+        deadline_time = wall_before;
         deadline_time.tv_sec += task_config.deadline_ms / 1000;
         deadline_time.tv_nsec +=
             (task_config.deadline_ms % 1000) * NSEC_PER_MSEC;
@@ -819,12 +839,17 @@ int main(int argc, char* argv[])
         do_calculations(loop_cnt);
 
         /* Record end time */
-        clock_gettime(clockid, &now);
+        clock_gettime(CLOCK_MONOTONIC, &wall_now);
+        if (clockid == CLOCK_MONOTONIC) {
+            now = wall_now;
+        } else {
+            clock_gettime(clockid, &now);
+        }
 
         /* Calculate runtime and check deadline */
         unsigned long runtime_us =
             diff(ts_ns(now), ts_ns(before)) / NSEC_PER_USEC;
-        bool deadline_miss = (ts_ns(now) > ts_ns(deadline_time));
+        bool deadline_miss = (ts_ns(wall_now) > ts_ns(deadline_time));
 
         /* Update statistics */
         if (task_config.enable_stats) {
