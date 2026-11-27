@@ -327,6 +327,7 @@ TEST(Phase0Context, BuildsOrderedRtSlotsAndTheTtFreeOffset)
     ASSERT_EQ(ctx.slots.size(), 4u);
     const uint64_t offsets[] = {0, 1 * kMs, 9 * kMs, 10 * kMs};
     const uint32_t shm_idx[] = {0, 1, 2, 0};
+    const uint64_t next_offsets[] = {1 * kMs, 9 * kMs, 10 * kMs, kH};
     for (size_t i = 0; i < ctx.slots.size(); ++i) {
         EXPECT_EQ(ctx.slots[i].offset_ns, offsets[i]);
         EXPECT_EQ(ctx.slots[i].deadline_ns,
@@ -335,9 +336,31 @@ TEST(Phase0Context, BuildsOrderedRtSlotsAndTheTtFreeOffset)
         EXPECT_EQ(ctx.slots[i].shm_idx, shm_idx[i]);
         EXPECT_EQ(ctx.slots[i].slot_idx, i);
         EXPECT_EQ(ctx.slots[i].cpu, kCpu);
+        EXPECT_EQ(ctx.slots[i].next_start_offset_ns, next_offsets[i]);
     }
     EXPECT_EQ(ctx.slots[2].end_ns, 10 * kMs);
     EXPECT_EQ(ctx.tt_free_offset_ns, 11 * kMs);
+}
+
+TEST(Phase0Context, PrecomputesSuccessorsPerCpuWithWrap)
+{
+    p0::NPrepared prepared = make_prepared(
+        {{"cpu2_first", 0, 100, 0},
+         {"cpu3_only", 0, 100, 1},
+         {"cpu2_second", 10000, 100, 2}},
+        2);
+    prepared.slots[0].cpu = 2;
+    prepared.slots[1].cpu = 3;
+    prepared.slots[2].cpu = 2;
+    prepared.cpus = {2, 3};
+
+    p0::Context ctx;
+    std::string error;
+    ASSERT_TRUE(p0::build_context(prepared, 1, ctx, error)) << error;
+    ASSERT_EQ(ctx.slots.size(), 3u);
+    EXPECT_EQ(ctx.slots[0].next_start_offset_ns, 10 * kMs);
+    EXPECT_EQ(ctx.slots[1].next_start_offset_ns, kH);
+    EXPECT_EQ(ctx.slots[2].next_start_offset_ns, kH);
 }
 
 TEST(Phase0Context, RejectsMissingTasksOverrunsAndDisorder)

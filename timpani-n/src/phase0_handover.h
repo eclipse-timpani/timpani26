@@ -47,6 +47,7 @@ struct HandoverConfig {
 struct RtSlot {
     uint64_t offset_ns = 0;
     uint64_t end_ns = 0;  // offset_ns + duration_ns
+    uint64_t next_start_offset_ns = 0;
     uint64_t deadline_ns = 0;
     uint64_t task_id_hash = 0;
     uint32_t cpu = 0;

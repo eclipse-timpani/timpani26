@@ -691,6 +691,22 @@ TEST_F(Phase0Test, RecoveryStopFailsWithoutConfirmedRemoval)
     EXPECT_EQ(Confirmed().SerializeAsString(), before);
 }
 
+TEST_F(Phase0Test, RecoveryStopRejectsMutexContentionWithoutWaiting)
+{
+    Seed();
+    auto held = Phase0TestPeer::Lock(Service());
+    auto stop = std::async(std::launch::async, [&] {
+        return server_->RemoveWorkload("W1", nullptr, false);
+    });
+    const bool returned_while_locked =
+        stop.wait_for(std::chrono::milliseconds(100)) ==
+        std::future_status::ready;
+    held.unlock();
+    EXPECT_TRUE(returned_while_locked);
+    EXPECT_FALSE(stop.get());
+    EXPECT_FALSE(Phase0TestPeer::Pending(Service()));
+}
+
 TEST_F(Phase0Test, DeltaPathIsRejectedOnlyInPhase0)
 {
     timpani::node::v1::ScheduleTableUpdate update;
@@ -748,6 +764,22 @@ TEST(Phase0ConfigurationTest, TwoConfiguredCpusAcceptDistributedPhase0Table)
     EXPECT_EQ(slots(updated, "W1"), initial_w1);
     EXPECT_EQ(slots(updated, "W2"), initial_w2);
     EXPECT_TRUE(Phase0TestPeer::Validate(service, updated));
+}
+
+TEST(Phase0ConfigurationTest, RejectsNodeWideNonHarmonicPeriodsAcrossCpus)
+{
+    auto config = std::make_shared<NodeConfigManager>();
+    ASSERT_TRUE(config->LoadFromFile(PHASE0_TWO_CPU_NODE_CONFIG));
+    timpani::orchestrator::OrchestratorServiceImpl orchestrator;
+    SchedInfoServer server(config);
+    ASSERT_TRUE(server.EnablePhase0(orchestrator));
+
+    const auto ten_ms = workload("H10", "ten_ms", 10000, 1000, 2000);
+    const auto fifteen_ms =
+        workload("H15", "fifteen_ms", 15000, 1000, 2000);
+    auto& service = Phase0TestPeer::Service(server);
+    EXPECT_FALSE(Phase0TestPeer::Replace(service, {ten_ms, fifteen_ms}));
+    EXPECT_FALSE(Phase0TestPeer::Pending(service));
 }
 
 TEST(Phase0ConfigurationTest, OneUnsentAttemptWaitsForInitialConnectionWithoutQueueing)

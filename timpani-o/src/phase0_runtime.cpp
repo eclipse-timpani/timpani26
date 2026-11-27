@@ -29,6 +29,18 @@ bool valid_identifier(const std::string& value)
         });
 }
 
+bool node_periods_are_harmonic(std::vector<uint64_t> periods)
+{
+    std::sort(periods.begin(), periods.end());
+    periods.erase(std::unique(periods.begin(), periods.end()), periods.end());
+    for (size_t i = 0; i < periods.size(); ++i) {
+        for (size_t j = i + 1; j < periods.size(); ++j) {
+            if (periods[j] % periods[i] != 0) return false;
+        }
+    }
+    return true;
+}
+
 using Slots = std::vector<std::tuple<std::string, uint32_t, uint32_t,
                                      uint32_t, uint32_t, uint32_t>>;
 
@@ -229,6 +241,7 @@ bool SchedInfoServiceImpl::ValidatePhase0Workloads(
     std::set<std::string> names;
     std::map<uint64_t, std::string> workload_hashes;
     std::map<uint64_t, std::string> task_hashes;
+    std::vector<uint64_t> periods;
     uint32_t hyperperiod = 0;
     for (auto& [id, workload] : workloads) {
         if (!valid_identifier(id) || workload.tasks().empty() ||
@@ -291,11 +304,16 @@ bool SchedInfoServiceImpl::ValidatePhase0Workloads(
                     classified.assigned_cpu = retained_cpu;
                 }
             }
+            periods.push_back(classified.period_us);
             tasks.push_back(std::move(classified));
             hyperperiod = std::max(hyperperiod, static_cast<uint32_t>(task.period()));
         }
     }
-    // For harmonic inputs H=max(period); the generator rejects non-harmonic input.
+    if (!node_periods_are_harmonic(std::move(periods))) {
+        error = "TT periods are not harmonic across the node CPU set";
+        return false;
+    }
+    // For harmonic inputs H=max(period); all task periods divide the frame.
     uint64_t slots = 0;
     for (const auto& task : tasks) slots += hyperperiod / task.period_us;
     if (slots > kMaxTtSlots) {
@@ -531,14 +549,10 @@ bool SchedInfoServiceImpl::RemovePhase0Workload(
     auto& state = *phase0_;
     std::string actual_id;
     {
-        std::unique_lock<std::mutex> lock(state.mutex, std::defer_lock);
-        if (trigger_push) {
-            if (!lock.try_lock()) {
-                TLOG_WARN("[RTU-P0] op=REMOVE result=rejected reason=busy");
-                return false;
-            }
-        } else {
-            lock.lock();
+        std::unique_lock<std::mutex> lock(state.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            TLOG_WARN("[RTU-P0] op=REMOVE result=rejected reason=busy");
+            return false;
         }
         uint64_t hash = 0;
         const bool hex = workload_id.rfind("0x", 0) == 0;

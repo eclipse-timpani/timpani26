@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <utility>
 
 #include "../../sample-apps/src/ttsched_shm.h"
@@ -86,6 +87,21 @@ bool build_context(const NPrepared& prepared, uint64_t token, Context& out,
         ctx.tt_free_offset_ns = std::max(ctx.tt_free_offset_ns, rt.end_ns);
         ctx.slots.push_back(rt);
     }
+
+    std::map<uint32_t, std::vector<size_t>> slots_by_cpu;
+    for (size_t i = 0; i < ctx.slots.size(); ++i)
+        slots_by_cpu[ctx.slots[i].cpu].push_back(i);
+    for (const auto& [cpu, indices] : slots_by_cpu) {
+        (void)cpu;
+        for (size_t i = 0; i < indices.size(); ++i) {
+            const size_t current = indices[i];
+            const size_t next = indices[(i + 1) % indices.size()];
+            ctx.slots[current].next_start_offset_ns =
+                ctx.slots[next].offset_ns +
+                (i + 1 == indices.size() ? ctx.hyperperiod_ns : 0);
+        }
+    }
+
     out = std::move(ctx);
     return true;
 }
@@ -275,11 +291,8 @@ void RtEngine::fire_next()
 {
     const std::vector<RtSlot>& slots = ctx_->slots;
     const RtSlot& slot = slots[next_slot_];
-    const uint64_t next_start =
-        next_slot_ + 1 < slots.size()
-            ? hp_ + slots[next_slot_ + 1].offset_ns
-            : hp_ + ctx_->hyperperiod_ns + slots[0].offset_ns;
-    platform_.fire(slot, hp_ + slot.offset_ns, next_start);
+    platform_.fire(slot, hp_ + slot.offset_ns,
+                   hp_ + slot.next_start_offset_ns);
     if (++next_slot_ < slots.size()) {
         next_wake_ns_ = hp_ + slots[next_slot_].offset_ns;
         return;
