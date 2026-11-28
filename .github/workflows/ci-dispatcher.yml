@@ -1,67 +1,143 @@
 name: CI Dispatcher
 
+# Entry point of the CI pipeline. It detects which parts of the repository
+# changed and only runs the matching reusable workflows:
+#
+#   timpani_rust/   -> run-rust-ci.yml         (Rust workspace)
+#   timpani-o/      -> run-timpani-o-ci.yml    (C++ orchestrator)
+#   libtrpc/,
+#   sample-apps/    -> run-native-libs-ci.yml  (C libraries / workloads)
+#   any C/C++       -> run-cpp-lint.yml        (clang-format + cppcheck)
+#   **/*.md         -> run-doc.yml
+#   workflows       -> run-validate.yml
+#
+# A manual run (workflow_dispatch) always runs everything.
 on:
   workflow_dispatch:
   push:
+    branches:
+      - develop_1.0
+      - main
   pull_request:
-    
-permissions: write-all
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   #  Job 1: Detect file changes and conditionally trigger jobs based on them
   detect-changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
-      rust_changed: ${{ steps.filter.outputs.rust }}  # Set to true if any Rust-relevant files changed
-      doc_changed: ${{ steps.filter.outputs.docs }}   # True if docs (Markdown) changed
-      yaml_changed: ${{ steps.filter.outputs.yaml }}  # True if GitHub workflow YAMLs changed
+      rust_changed: ${{ steps.filter.outputs.rust }}                # Rust workspace
+      timpani_o_changed: ${{ steps.filter.outputs.timpani_o }}      # timpani-o (C++)
+      native_libs_changed: ${{ steps.filter.outputs.native_libs }}  # libtrpc, sample-apps (C)
+      cpp_changed: ${{ steps.filter.outputs.cpp }}                  # any C/C++ source
+      doc_changed: ${{ steps.filter.outputs.docs }}                 # Markdown docs
+      yaml_changed: ${{ steps.filter.outputs.yaml }}                # GitHub workflow YAMLs
     steps:
       # Step 1: Checkout repo contents
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Step 2: Use `dorny/paths-filter` to detect what kinds of files changed
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             rust:
-              - '**/*.rs'         # All Rust source files
-              - '**/*.toml'       # Cargo.toml or other TOML configs
-              - 'Cargo.lock'      # Cargo.lock for dependency changes
-              - 'scripts/**'      # Shell scripts that might affect build/test
-              - 'Makefile'        # Dev tooling changes
-              - '**/*.yaml'       # Scenario or config YAMLs
-              - '**/*.sh'         # Bash scripts
+              - 'timpani_rust/**'
+              - 'scripts/rust/**'
+              - '.github/workflows/run-rust-ci.yml'
+            timpani_o:
+              - 'timpani-o/**'
+              - 'VERSION'
+              - 'scripts/cpp/**'
+              - '.github/workflows/run-timpani-o-ci.yml'
+            native_libs:
+              - 'libtrpc/**'
+              - 'sample-apps/**'
+              - 'VERSION'
+              - 'scripts/cpp/**'
+              - '.github/workflows/run-native-libs-ci.yml'
+            cpp:
+              - 'timpani-o/**'
+              - 'libtrpc/**'
+              - 'sample-apps/**'
+              - '.clang-format'
+              - 'scripts/cpp/**'
+              - '.github/workflows/run-cpp-lint.yml'
             docs:
-              - '**/*.md'         # Markdown docs (README, etc.)
+              - '**/*.md'
             yaml:
-              - '.github/workflows/*.yml'  # GitHub workflow YAMLs
+              - '.github/workflows/*.yml'
 
-  #  Job 2: Trigger full Rust CI workflow if Rust files or configs changed
+  #  Job 2: Rust workspace CI (build, test, clippy, fmt, deny, coverage)
   run-rust-ci:
     needs: detect-changes
-    if: needs.detect-changes.outputs.rust_changed == 'true'
-    uses: ./.github/workflows/run-rust-ci.yml  # Reuse centralized Rust CI logic
+    if: needs.detect-changes.outputs.rust_changed == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/run-rust-ci.yml
 
-  #  Job 3: Run markdown/documentation linter if only docs changed
+  #  Job 3: timpani-o (C++) build, unit tests, sanitizers, coverage, container
+  run-timpani-o-ci:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.timpani_o_changed == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/run-timpani-o-ci.yml
+
+  #  Job 4: libtrpc + sample-apps (C)
+  run-native-libs-ci:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.native_libs_changed == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/run-native-libs-ci.yml
+
+  #  Job 5: clang-format + cppcheck for the C/C++ code
+  run-cpp-lint:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.cpp_changed == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/run-cpp-lint.yml
+
+  #  Job 6: Run markdown/documentation linter if docs changed
   run-doc-lint:
     needs: detect-changes
-    if: needs.detect-changes.outputs.doc_changed == 'true'
+    if: needs.detect-changes.outputs.doc_changed == 'true' || github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/run-doc.yml
 
-  #  Job 4: Validate GitHub YAML workflows (lint schema or check logic)
+  #  Job 7: Validate GitHub YAML workflows (lint schema or check logic)
   run-yaml-validation:
     needs: detect-changes
-    if: needs.detect-changes.outputs.yaml_changed == 'true'
+    if: needs.detect-changes.outputs.yaml_changed == 'true' || github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/run-validate.yml
 
-  #  Job 5: Always run this last to print a clean summary in Actions UI
+  #  Job 8: Always run last. Fails if any triggered job failed or was
+  #  cancelled; skipped jobs (nothing changed) are fine. detect-changes is
+  #  included so that a failed change detection (which skips every other job)
+  #  cannot produce a green summary. Use this job as the single required
+  #  status check in branch protection.
   ci-summary:
     name: CI Complete Summary
     runs-on: ubuntu-latest
-    if: always()  # Run even if earlier jobs were skipped or failed
+    timeout-minutes: 15
+    if: always()
     needs:
+      - detect-changes
       - run-rust-ci
+      - run-timpani-o-ci
+      - run-native-libs-ci
+      - run-cpp-lint
       - run-doc-lint
       - run-yaml-validation
     steps:
-      - run: echo " All CI jobs (if triggered) have completed."
+      - name: Evaluate results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          if echo "$RESULTS" | grep -Eq "failure|cancelled"; then
+            echo "::error ::One or more CI jobs failed"
+            exit 1
+          fi
+          echo "All CI jobs (if triggered) have completed."

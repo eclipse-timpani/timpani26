@@ -1,0 +1,144 @@
+name: timpani-o CI (C++)
+
+# Reusable CI for the timpani-o orchestrator (C++17 / gRPC / CMake).
+#   - build + unit tests on amd64 and arm64 native runners
+#   - ASan + UBSan test run
+#   - line coverage report (gcovr)
+#   - container image build check (no push)
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build and test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: ./scripts/cpp/installdeps.sh timpani-o
+
+      - name: Build timpani-o
+        run: ./scripts/cpp/build.sh timpani-o
+
+      - name: Run unit tests
+        run: ./scripts/cpp/test.sh timpani-o
+        env:
+          REPORT_TAG: ${{ matrix.arch }}
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: timpani-o-test-report-${{ matrix.arch }}
+          path: |
+            dist/tests/*
+            dist/reports/test/*
+            dist/reports/build/*
+
+      - name: Upload timpani-o binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: timpani-o-binary-linux-${{ matrix.arch }}
+          path: dist/build/timpani-o/timpani-o
+          if-no-files-found: error
+
+  sanitizers:
+    name: ASan + UBSan tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: ./scripts/cpp/installdeps.sh timpani-o
+
+      - name: Build with AddressSanitizer and UBSan
+        run: ./scripts/cpp/build.sh timpani-o
+        env:
+          BUILD_TYPE: Debug
+          SANITIZE: address,undefined
+          BUILD_DIR: ${{ github.workspace }}/dist/build/timpani-o-san
+
+      - name: Run unit tests under sanitizers
+        run: ./scripts/cpp/test.sh timpani-o
+        env:
+          BUILD_DIR: ${{ github.workspace }}/dist/build/timpani-o-san
+          REPORT_TAG: sanitizers
+
+      - name: Upload sanitizer test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: timpani-o-sanitizer-report
+          path: |
+            dist/tests/*
+            dist/reports/test/*
+
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: ./scripts/cpp/installdeps.sh timpani-o lint
+
+      - name: Build, test and generate coverage
+        run: ./scripts/cpp/coverage.sh
+        env:
+          COVERAGE_MIN_LINES: "0"   # raise once a baseline is agreed
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          if [ -f dist/coverage/timpani-o/coverage_summary.md ]; then
+            cat dist/coverage/timpani-o/coverage_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: timpani-o-coverage-report
+          path: dist/coverage/timpani-o/*
+
+  container:
+    name: Container image build check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v7
+        with:
+          context: timpani-o
+          file: timpani-o/Dockerfile
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            TARGETARCH=amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

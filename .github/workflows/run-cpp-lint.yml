@@ -1,0 +1,76 @@
+name: C/C++ Lint
+
+# Reusable lint workflow for all C/C++ code:
+#   - clang-format  (incremental: only lines changed in the PR/push are gated)
+#   - cppcheck      (fails on "error" findings, lists warnings in the report)
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpp_lint:
+    name: clang-format and cppcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # needed to diff against the base commit
+
+      - name: Install lint tools
+        run: ./scripts/cpp/installdeps.sh lint
+
+      # Pick the commit to diff against: the PR base, or the commit before
+      # the push. If none is available the format check is report-only.
+      - name: Determine base ref
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="origin/$PR_BASE_REF"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              base="$PUSH_BEFORE"
+            fi
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Base ref: ${base:-<none: report-only>}"
+
+      - name: Run clang-format check
+        run: ./scripts/cpp/fmt_check.sh
+        env:
+          BASE_REF: ${{ steps.base.outputs.base }}
+
+      - name: Run cppcheck
+        if: always()
+        run: ./scripts/cpp/static_check.sh
+
+      - name: Publish reports to job summary
+        if: always()
+        run: |
+          for f in dist/reports/cpp-fmt/fmt_summary.md dist/reports/cppcheck/cppcheck_summary.md; do
+            [ -f "$f" ] && cat "$f" >> "$GITHUB_STEP_SUMMARY"
+          done
+          true
+
+      - name: Upload format report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpp-fmt-report
+          path: dist/reports/cpp-fmt/*
+
+      - name: Upload cppcheck report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cppcheck-report
+          path: dist/reports/cppcheck/*

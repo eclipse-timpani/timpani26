@@ -1,23 +1,25 @@
 name: Validate Workflow YAML
 
-# This workflow is reusable and can also be triggered manually
+# Lints every workflow with actionlint: YAML syntax, job/needs graph,
+# ${{ }} expressions, action inputs, and shellcheck on `run:` scripts.
+# Reusable, and can also be triggered manually.
 on:
-  workflow_call:         # Allows this workflow to be called from other workflows
-  workflow_dispatch:     # Enables manual trigger via GitHub UI
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   validate_yaml:
-    runs-on: ubuntu-latest  # Use the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
-      # Step 1: Checkout the repository so we can access workflow files
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      # Step 2: Validate all .yml workflow files using `yq`
-      - name: Validate workflows
+      # The image bundles shellcheck and pyflakes. Pinned so results are
+      # reproducible; bump the version deliberately.
+      - name: Lint workflows with actionlint
         run: |
-          # Loop through each workflow file in .github/workflows
-          for file in .github/workflows/*.yml; do
-            # Use `yq` to parse the YAML; exit non-zero if invalid
-            yq eval '.' "$file" > /dev/null
-          done
+          docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12

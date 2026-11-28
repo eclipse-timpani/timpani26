@@ -1,0 +1,42 @@
+name: Native libraries CI (libtrpc, sample-apps)
+
+# Reusable CI for the C components: libtrpc (D-Bus RPC library) and the
+# sample-apps workloads / libttsched.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.component }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [libtrpc, sample-apps]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: ./scripts/cpp/installdeps.sh libs
+
+      - name: Build ${{ matrix.component }}
+        run: ./scripts/cpp/build.sh ${{ matrix.component }}
+
+      - name: Upload build reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.component }}-build-report-${{ matrix.arch }}
+          path: dist/reports/build/*

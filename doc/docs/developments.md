@@ -67,6 +67,101 @@ Typical CI checks include:
 - cargo deny (license/dependency checks)
 - cargo tarpaulin (coverage, optional)
 
+### CI pipeline layout
+
+`.github/workflows/ci-dispatcher.yml` is the single entry point. It detects
+which paths changed and calls only the matching reusable workflow. A manual
+run (`workflow_dispatch`) runs everything.
+
+| Changed path | Workflow | What it does |
+|:--|:--|:--|
+| `timpani_rust/` | `run-rust-ci.yml` | build, test, clippy, fmt, deny, coverage |
+| `timpani-o/` | `run-timpani-o-ci.yml` | build + `ctest` (amd64, arm64), ASan/UBSan, gcovr coverage, image build check |
+| `libtrpc/`, `sample-apps/` | `run-native-libs-ci.yml` | CMake build (amd64, arm64) |
+| any C/C++ | `run-cpp-lint.yml` | clang-format (changed lines only), cppcheck |
+| `**/*.md` | `run-doc.yml` | markdownlint (report only, uploaded as an artifact) |
+| `.github/workflows/` | `run-validate.yml` | actionlint (syntax, job graph, expressions, action inputs, shellcheck) |
+
+The final `CI Complete Summary` job fails if any triggered job failed or was
+cancelled, or if change detection itself failed. Configure it as the required
+status check in the branch protection rules of `develop_1.0` and `main` so that
+a failing pipeline blocks merging.
+
+Workflow conventions: every job sets `timeout-minutes`, workflows use the least
+permissions they need (`contents: read` by default), and action versions are
+kept on current majors that run on Node 24. Run `actionlint` locally before
+pushing workflow changes:
+
+```bash
+docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12
+```
+
+### Scripts layout
+
+| Folder | Content |
+|:--|:--|
+| `scripts/rust/` | Rust CI scripts used by `run-rust-ci.yml` (`installdeps.sh`, `buildNparse.sh`, `testNparse.sh`, `clippy_check.sh`, `fmt_check.sh`, `deny_check.sh`, `test_coverage.sh`, `license_check.sh`). Run them from the repository root. |
+| `scripts/cpp/` | C/C++ CI scripts used by the timpani-o, native libs, lint and package workflows |
+| `scripts/` | Development helpers that are not part of CI (`mock_pullpiri*`, `verify_pipeline.sh`, ...) |
+
+### Running the C/C++ checks locally
+
+The workflows call scripts in `scripts/cpp/`, so the same commands work
+locally (Ubuntu 22.04 or newer):
+
+```bash
+scripts/cpp/installdeps.sh timpani-o lint   # groups: timpani-o, libs, lint, all
+scripts/cpp/build.sh timpani-o              # also: libtrpc, sample-apps
+scripts/cpp/test.sh timpani-o               # ctest + JUnit XML in dist/tests
+scripts/cpp/coverage.sh                     # gcovr reports in dist/coverage/timpani-o
+BASE_REF=origin/develop_1.0 scripts/cpp/fmt_check.sh
+scripts/cpp/static_check.sh                 # cppcheck
+```
+
+Useful environment variables: `BUILD_TYPE`, `SANITIZE=address,undefined`,
+`COVERAGE_MIN_LINES`, `FMT_STRICT=1`, `CPPCHECK_STRICT=1`.
+
+The existing sources are not fully clang-format clean, so the format gate is
+incremental: it only fails on lines changed relative to the base branch.
+
+### Release and delivery (CD)
+
+Delivery is tag driven, as in pullpiri. The version comes from the `VERSION`
+file (CalVer, see `doc/VERSIONING.md`).
+
+| Tag | Workflow | Result |
+|:--|:--|:--|
+| `v<VERSION>` (e.g. `v2026.08.0`) | `release.yml` | full CI gates, release packages, GitHub Release, container image |
+| `dev*` (e.g. `dev-2026.08.0-1`) | `dev-release.yml` | fast pre-release, no CI gates |
+
+```bash
+# release (VERSION must be 2026.08.0 and CHANGELOG.md must have "## [2026.08.0]")
+git tag v2026.08.0
+git push origin v2026.08.0
+```
+
+`release.yml` steps:
+
+1. `verify-version`: the tag must equal `v` plus the content of `VERSION`, and
+   `CHANGELOG.md` must contain a `## [<VERSION>]` section.
+2. CI gates: Rust CI, timpani-o CI, native libs CI, C/C++ lint,
+   docs lint and workflow YAML validation.
+3. `package` (`run-package.yml`, `scripts/cpp/package.sh`): release build of
+   timpani-o for amd64 and arm64 as
+   `timpani-o-<VERSION>-linux-<arch>.tar.gz` plus SHA-256 files.
+4. `publish-release`: only after every gate passed, uploads the packages,
+   `SHA256SUMS-timpani`, CI reports, timpani-o coverage report,
+   `CHANGELOG.md`, documentation archive and the Eclipse QuEVee quality
+   manifest to the GitHub Release.
+5. `build-and-push-container` (`build-container.yml`): multi-arch
+   (`linux/amd64`, `linux/arm64`) timpani-o image from `timpani-o/Dockerfile`,
+   pushed to `ghcr.io/<owner>/timpani26/timpani-o` with the tag name and
+   `latest`.
+
+`dev-release.yml` only runs `package`, publishes the packages and checksums as
+a GitHub pre-release and pushes the container image tagged with the tag name
+and `dev-latest`.
+
 ---
 
 ## Static analysis

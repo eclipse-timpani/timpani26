@@ -5,30 +5,40 @@ on:
   workflow_dispatch: 
 
 permissions:
-  packages: write
-
-env:
-  ContainerRegistry: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}-rust
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: timpani_rust
+
+      # Prebuilt binaries: avoids compiling cargo-deny and cargo-tarpaulin from
+      # source on every run. installdeps.sh and test_coverage.sh only run
+      # `cargo install` for them when they are missing.
+      - name: Install cargo-deny and cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-tarpaulin
+
       - name: Make scripts executable
-        run: chmod +x scripts/*.sh
+        run: chmod +x scripts/rust/*.sh
 
       - name: Install project dependencies
-        run: ./scripts/installdeps.sh
+        run: ./scripts/rust/installdeps.sh
 
       - name: Create output folders
         run: |
@@ -39,79 +49,54 @@ jobs:
           mkdir -p dist/reports/clippy
 
       - name: Build and parse project
-        run: ./scripts/buildNparse.sh
+        run: ./scripts/rust/buildNparse.sh
 
       - name: Run tests and generate report
-        run: ./scripts/testNparse.sh
+        run: ./scripts/rust/testNparse.sh
 
       - name: Run Clippy (lint)
-        run: ./scripts/clippy_check.sh
+        run: ./scripts/rust/clippy_check.sh
 
       - name: Run format check
-        run: ./scripts/fmt_check.sh
+        run: ./scripts/rust/fmt_check.sh
 
       - name: Run cargo-deny checks
-        run: ./scripts/deny_check.sh
+        run: ./scripts/rust/deny_check.sh
 
       - name: Run test coverage script
-        run: ./scripts/test_coverage.sh
+        run: ./scripts/rust/test_coverage.sh
 
       - name: Upload deny report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deny-report
           path: dist/reports/deny/deny_summary.md
 
       - name: Upload fmt report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fmt-report
           path: dist/reports/fmt/fmt_summary.md
 
       - name: Upload clippy report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clippy-report
           path: dist/reports/clippy/clippy_summary.md
 
       - name: Upload test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-report
           path: dist/tests/*
 
       - name: Upload coverage reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: dist/coverage/*
-
-      # - name: Set up QEMU
-      #   uses: docker/setup-qemu-action@v3
-
-      # - name: Set up Docker Buildx
-      #   uses: docker/setup-buildx-action@v3
-
-      # - name: Log in to GitHub Container Registry
-      #   uses: docker/login-action@v3
-      #   with:
-      #     registry: ghcr.io
-      #     username: ${{ github.actor }}
-      #     password: ${{ secrets.GITHUB_TOKEN }}
-
-      # - name: Build and push multi-arch image
-      #   uses: docker/build-push-action@v6
-      #   with:
-      #     context: .
-      #     file: ./timpani_rust/Dockerfile
-      #     platforms: linux/amd64,linux/arm64
-      #     push: false
-      #     build-args: |
-      #       TARGETARCH
-      #     tags: |
-      #       ${{ env.ContainerRegistry }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
